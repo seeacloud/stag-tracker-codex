@@ -7,6 +7,7 @@ from .models import (
     Detection,
     StagObservation,
     Track,
+    append_track_history,
     bbox_area,
     bbox_center,
     bbox_iou,
@@ -45,6 +46,11 @@ class FusionTracker:
         self._drop_stale()
         return self.tracks
 
+    def record_predicted_history(self) -> list[Track]:
+        for track in self.tracks:
+            append_track_history(track)
+        return self.tracks
+
     def update(
         self,
         gray: np.ndarray,
@@ -66,6 +72,7 @@ class FusionTracker:
 
         self._merge_duplicate_marker_tracks()
         self._drop_stale()
+        self._record_unmatched_history(matched_track_ids)
         return self.tracks
 
     def _dedupe_observations(
@@ -206,8 +213,8 @@ class FusionTracker:
             pose=measurement["pose"],  # type: ignore[arg-type]
             source=str(measurement["source"]),
         )
-        track.history.append(bbox_center(track.bbox))
         self._stabilize_track(track, reset=True)
+        append_track_history(track)
         self._next_track_id += 1
         return track
 
@@ -230,10 +237,9 @@ class FusionTracker:
         track.missed = 0
         track.detection_missed = 0
         track.source = str(measurement["source"])
-        track.history.append(bbox_center(track.bbox))
-        track.history = track.history[-64:]
         self.flow.refresh_points(gray, track)
         self._stabilize_track(track)
+        append_track_history(track)
 
     def _drop_stale(self) -> None:
         self.tracks = [
@@ -241,6 +247,11 @@ class FusionTracker:
             for track in self.tracks
             if max(track.missed, track.detection_missed) <= self.max_missed
         ]
+
+    def _record_unmatched_history(self, matched_track_ids: set[int]) -> None:
+        for track in self.tracks:
+            if track.track_id not in matched_track_ids:
+                append_track_history(track)
 
     def _merge_duplicate_marker_tracks(self) -> None:
         best_by_marker: dict[int, Track] = {}

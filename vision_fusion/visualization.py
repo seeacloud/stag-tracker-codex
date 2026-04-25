@@ -6,9 +6,12 @@ import numpy as np
 from .models import Detection, StagObservation, Track
 
 
-TRACK_COLOR = (40, 220, 120)
+STAG_TRACK_COLOR = (40, 220, 120)
+HOLD_TRACK_COLOR = (255, 120, 40)
+FLOW_TRACK_COLOR = (220, 80, 220)
+TRACK_FALLBACK_COLOR = (80, 180, 220)
 YOLO_COLOR = (255, 170, 40)
-STAG_COLOR = (80, 160, 255)
+STAG_COLOR = STAG_TRACK_COLOR
 TEXT_COLOR = (245, 245, 245)
 
 
@@ -36,9 +39,9 @@ def draw_tracks(frame: np.ndarray, tracks: list[Track], visual_hold: int = 0) ->
     for track in tracks:
         x, y, w, h = _display_bbox(track)
         visually_seen = track.detection_missed <= visual_hold
-        color = TRACK_COLOR if visually_seen else (80, 180, 220)
+        state = track_display_state(track, visual_hold)
+        color = track_color(track, visual_hold)
         cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
-        state = track.source if track.source == "stag" else ("hold" if visually_seen else track.source)
         label = (
             f"#{track.track_id} {track.label} "
             f"{track.confidence:.2f} {state} "
@@ -48,12 +51,87 @@ def draw_tracks(frame: np.ndarray, tracks: list[Track], visual_hold: int = 0) ->
 
         if track.display_corners is not None and visually_seen:
             corners = track.display_corners.astype(int).reshape(-1, 2)
-            cv2.polylines(frame, [corners], isClosed=True, color=STAG_COLOR, thickness=2)
+            cv2.polylines(frame, [corners], isClosed=True, color=color, thickness=2)
 
-        if len(track.history) >= 2:
-            pts = np.asarray(track.history, dtype=np.int32).reshape(-1, 1, 2)
-            cv2.polylines(frame, [pts], isClosed=False, color=color, thickness=1)
+        draw_track_history(frame, track, visual_hold)
     return frame
+
+
+def track_display_state(track: Track, visual_hold: int = 0) -> str:
+    if track.source == "stag":
+        return "stag"
+    if track.marker_id is not None and track.detection_missed <= visual_hold:
+        return "hold"
+    if track.source in {"flow", "predicted"}:
+        return "flow"
+    return track.source
+
+
+def track_color(track: Track, visual_hold: int = 0) -> tuple[int, int, int]:
+    state = track_display_state(track, visual_hold)
+    return track_state_color(state)
+
+
+def track_state_color(state: str) -> tuple[int, int, int]:
+    if state == "stag":
+        return STAG_TRACK_COLOR
+    if state == "hold":
+        return HOLD_TRACK_COLOR
+    if state == "flow":
+        return FLOW_TRACK_COLOR
+    return TRACK_FALLBACK_COLOR
+
+
+def track_history_state(track: Track, point_index: int, visual_hold: int = 0) -> str:
+    source = _history_value(track.history_sources, point_index, track.source)
+    detection_missed = _history_value(
+        track.history_detection_missed,
+        point_index,
+        track.detection_missed,
+    )
+    marker_id = _history_value(track.history_marker_ids, point_index, track.marker_id)
+
+    if source == "stag":
+        return "stag"
+    if marker_id is not None and detection_missed <= visual_hold:
+        return "hold"
+    if source in {"flow", "predicted"}:
+        return "flow"
+    return source
+
+
+def track_history_segment_color(
+    track: Track,
+    point_index: int,
+    visual_hold: int = 0,
+) -> tuple[int, int, int]:
+    return track_state_color(track_history_state(track, point_index, visual_hold))
+
+
+def draw_track_history(
+    frame: np.ndarray,
+    track: Track,
+    visual_hold: int = 0,
+) -> None:
+    if len(track.history) < 2:
+        return
+    pts = np.asarray(track.history, dtype=np.int32).reshape(-1, 2)
+    for index in range(1, len(pts)):
+        color = track_history_segment_color(track, index, visual_hold)
+        cv2.line(
+            frame,
+            tuple(int(value) for value in pts[index - 1]),
+            tuple(int(value) for value in pts[index]),
+            color,
+            1,
+            cv2.LINE_AA,
+        )
+
+
+def _history_value(values: list, index: int, fallback):
+    if 0 <= index < len(values):
+        return values[index]
+    return fallback
 
 
 def _display_bbox(track: Track) -> tuple[int, int, int, int]:

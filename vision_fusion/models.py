@@ -7,6 +7,7 @@ import numpy as np
 
 
 BBox = tuple[int, int, int, int]
+TRACK_HISTORY_LIMIT = 64
 
 
 @dataclass(slots=True)
@@ -49,6 +50,9 @@ class Track:
     source: str = "init"
     velocity: tuple[float, float] = (0.0, 0.0)
     history: list[tuple[int, int]] = field(default_factory=list)
+    history_sources: list[str] = field(default_factory=list)
+    history_detection_missed: list[int] = field(default_factory=list)
+    history_marker_ids: list[Optional[int]] = field(default_factory=list)
 
 
 def clip_bbox(bbox: BBox, width: int, height: int, padding: int = 0) -> BBox:
@@ -63,6 +67,55 @@ def clip_bbox(bbox: BBox, width: int, height: int, padding: int = 0) -> BBox:
 def bbox_center(bbox: BBox) -> tuple[int, int]:
     x, y, w, h = bbox
     return int(x + w / 2), int(y + h / 2)
+
+
+def append_track_history(
+    track: Track,
+    source: Optional[str] = None,
+    detection_missed: Optional[int] = None,
+    marker_id: Optional[int] = None,
+) -> None:
+    history_source = track.source if source is None else source
+    missed = track.detection_missed if detection_missed is None else detection_missed
+    tracked_marker_id = track.marker_id if marker_id is None else marker_id
+
+    _pad_track_history_metadata(track, history_source, missed, tracked_marker_id)
+    track.history.append(bbox_center(track.bbox))
+    track.history_sources.append(history_source)
+    track.history_detection_missed.append(missed)
+    track.history_marker_ids.append(tracked_marker_id)
+    trim_track_history(track)
+
+
+def trim_track_history(track: Track, limit: int = TRACK_HISTORY_LIMIT) -> None:
+    for values in (
+        track.history,
+        track.history_sources,
+        track.history_detection_missed,
+        track.history_marker_ids,
+    ):
+        overflow = len(values) - limit
+        if overflow > 0:
+            del values[:overflow]
+
+
+def _pad_track_history_metadata(
+    track: Track,
+    source: str,
+    detection_missed: int,
+    marker_id: Optional[int],
+) -> None:
+    missing = len(track.history) - len(track.history_sources)
+    if missing > 0:
+        track.history_sources.extend([source] * missing)
+
+    missing = len(track.history) - len(track.history_detection_missed)
+    if missing > 0:
+        track.history_detection_missed.extend([detection_missed] * missing)
+
+    missing = len(track.history) - len(track.history_marker_ids)
+    if missing > 0:
+        track.history_marker_ids.extend([marker_id] * missing)
 
 
 def bbox_area(bbox: BBox) -> int:

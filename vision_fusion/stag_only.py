@@ -122,8 +122,11 @@ def main() -> int:
     try:
         while ok:
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            predicted = False
+            updated = False
             if not args.no_memory and previous_gray is not None and fusion.tracks:
                 fusion.predict(previous_gray, gray)
+                predicted = True
 
             observations = []
             should_detect = frame_index % max(1, args.detect_interval) == 0
@@ -132,6 +135,10 @@ def main() -> int:
                 observations = detector.detect(frame, rois=rois)
                 if not args.no_memory:
                     fusion.update(gray, [], observations)
+                    updated = True
+
+            if not args.no_memory and predicted and not updated:
+                fusion.record_predicted_history()
 
             now = time.perf_counter()
             fps = 1.0 / max(now - last_time, 1e-6)

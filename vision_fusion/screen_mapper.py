@@ -7,6 +7,12 @@ import cv2
 import numpy as np
 
 from .models import BBox, StagObservation, Track, bbox_from_points, clip_bbox
+from .visualization import (
+    STAG_COLOR,
+    track_color,
+    track_display_state,
+    track_history_segment_color,
+)
 
 
 @dataclass(slots=True)
@@ -113,9 +119,12 @@ def draw_screen_tracks(
 ) -> None:
     for track in tracks:
         visually_seen = track.detection_missed <= visual_hold
+        color = track_color(track, visual_hold)
+        draw_screen_track_history(frame, track, mapper, visual_hold)
+
         if track.display_corners is not None and visually_seen:
             mapped = mapper.transform_points(track.display_corners).astype(np.int32)
-            cv2.polylines(frame, [mapped.reshape(-1, 1, 2)], True, (80, 160, 255), 2)
+            cv2.polylines(frame, [mapped.reshape(-1, 1, 2)], True, color, 2)
             label_point = mapped[0]
         else:
             x, y, w, h = track.display_bbox if track.display_bbox is not None else track.bbox
@@ -129,12 +138,12 @@ def draw_screen_tracks(
                 dtype=np.float32,
             )
             mapped = mapper.transform_points(corners).astype(np.int32)
-            cv2.polylines(frame, [mapped.reshape(-1, 1, 2)], True, (80, 180, 220), 2)
+            cv2.polylines(frame, [mapped.reshape(-1, 1, 2)], True, color, 2)
             label_point = mapped[0]
 
-        state = track.source if track.source == "stag" else ("hold" if visually_seen else track.source)
+        state = track_display_state(track, visual_hold)
         label = f"#{track.track_id} {track.label} {state} seenmiss:{track.detection_missed}"
-        draw_label(frame, int(label_point[0]), int(label_point[1]), label)
+        draw_label(frame, int(label_point[0]), int(label_point[1]), label, color)
 
 
 def draw_screen_observations(
@@ -144,12 +153,40 @@ def draw_screen_observations(
 ) -> None:
     for observation in observations:
         mapped = mapper.transform_points(observation.corners).astype(np.int32)
-        cv2.polylines(frame, [mapped.reshape(-1, 1, 2)], True, (80, 160, 255), 2)
+        cv2.polylines(frame, [mapped.reshape(-1, 1, 2)], True, STAG_COLOR, 2)
         label = f"stag:{observation.marker_id}"
-        draw_label(frame, int(mapped[0][0]), int(mapped[0][1]), label)
+        draw_label(frame, int(mapped[0][0]), int(mapped[0][1]), label, STAG_COLOR)
 
 
-def draw_label(frame: np.ndarray, x: int, y: int, text: str) -> None:
+def draw_screen_track_history(
+    frame: np.ndarray,
+    track: Track,
+    mapper: ScreenMapper,
+    visual_hold: int = 0,
+) -> None:
+    if len(track.history) < 2:
+        return
+    mapped = mapper.transform_points(np.asarray(track.history, dtype=np.float32))
+    pts = mapped.astype(np.int32).reshape(-1, 2)
+    for index in range(1, len(pts)):
+        color = track_history_segment_color(track, index, visual_hold)
+        cv2.line(
+            frame,
+            tuple(int(value) for value in pts[index - 1]),
+            tuple(int(value) for value in pts[index]),
+            color,
+            1,
+            cv2.LINE_AA,
+        )
+
+
+def draw_label(
+    frame: np.ndarray,
+    x: int,
+    y: int,
+    text: str,
+    color: tuple[int, int, int] = (40, 40, 40),
+) -> None:
     font = cv2.FONT_HERSHEY_SIMPLEX
     scale = 0.45
     thickness = 1
@@ -160,7 +197,7 @@ def draw_label(frame: np.ndarray, x: int, y: int, text: str) -> None:
         frame,
         (x, y - th - baseline - 4),
         (min(frame.shape[1] - 1, x + tw + 6), y + baseline),
-        (40, 40, 40),
+        color,
         -1,
     )
     cv2.putText(

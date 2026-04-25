@@ -165,9 +165,12 @@ def main() -> int:
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             detections = []
             observations = []
+            predicted = False
+            updated = False
 
             if previous_gray is not None and fusion.tracks:
                 fusion.predict(previous_gray, gray)
+                predicted = True
 
             should_refresh = frame_index % max(1, args.detect_interval) == 0
             if should_refresh:
@@ -179,6 +182,10 @@ def main() -> int:
                     rois = [full_frame_roi(frame)]
                     observations = stag.detect(frame, rois=rois)
                 fusion.update(gray, detections, observations)
+                updated = True
+
+            if predicted and not updated:
+                fusion.record_predicted_history()
 
             now = time.perf_counter()
             fps = 1.0 / max(now - last_time, 1e-6)

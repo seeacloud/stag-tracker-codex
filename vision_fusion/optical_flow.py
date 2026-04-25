@@ -3,7 +3,7 @@ from __future__ import annotations
 import cv2
 import numpy as np
 
-from .models import BBox, Track, bbox_area, bbox_center, bbox_from_points, clip_bbox
+from .models import BBox, Track, bbox_area, bbox_from_points, clip_bbox
 
 
 class OpticalFlowTracker:
@@ -125,8 +125,6 @@ class OpticalFlowTracker:
         track.missed = 0
         track.age += 1
         track.source = "flow"
-        track.history.append(bbox_center(new_bbox))
-        track.history = track.history[-64:]
         return track
 
     def _filter_forward_backward(
@@ -212,6 +210,4 @@ class OpticalFlowTracker:
         track.missed += 1
         track.age += 1
         track.source = "predicted"
-        track.history.append(bbox_center(track.bbox))
-        track.history = track.history[-64:]
         return track
