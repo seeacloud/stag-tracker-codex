@@ -33,6 +33,18 @@ class StagObservation:
 
 
 @dataclass(slots=True)
+class StagCandidate:
+    """A quad that the STag detector found but could not decode into an id.
+
+    Useful for visualizing 'something is there but unrecognized' so the user
+    can see why a marker fails (occlusion, glare, motion blur, low contrast).
+    """
+
+    corners: np.ndarray
+    bbox: BBox
+
+
+@dataclass(slots=True)
 class Track:
     track_id: int
     bbox: BBox

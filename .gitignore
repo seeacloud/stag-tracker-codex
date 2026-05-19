@@ -18,5 +18,9 @@ env/
 screen_map*.npz
 calib*.npz
 
+# Test artefacts — local-only
+docs/test-screenshots/
+.claude/
+
 .DS_Store
 Thumbs.db

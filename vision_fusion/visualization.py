@@ -3,7 +3,7 @@ from __future__ import annotations
 import cv2
 import numpy as np
 
-from .models import Detection, StagObservation, Track
+from .models import Detection, StagCandidate, StagObservation, Track
 
 
 STAG_TRACK_COLOR = (40, 220, 120)
@@ -12,6 +12,7 @@ FLOW_TRACK_COLOR = (220, 80, 220)
 TRACK_FALLBACK_COLOR = (80, 180, 220)
 YOLO_COLOR = (255, 170, 40)
 STAG_COLOR = STAG_TRACK_COLOR
+CANDIDATE_COLOR = (255, 90, 30)  # BGR — bright blue for unrecognized quad candidates
 TEXT_COLOR = (245, 245, 245)
 
 
@@ -32,6 +33,33 @@ def draw_observations(frame: np.ndarray, observations: list[StagObservation]) ->
         if obs.pose is not None:
             t = obs.pose.tvec.reshape(-1)
             _label(frame, x, y + 18, f"t=({t[0]:.2f},{t[1]:.2f},{t[2]:.2f})", STAG_COLOR)
+    return frame
+
+
+def draw_candidates(
+    frame: np.ndarray,
+    candidates: list[StagCandidate],
+    label: bool = True,
+) -> np.ndarray:
+    """Draw rejected STag candidate quads as thin blue boxes.
+
+    These are quads the detector localized but could not decode into a known id —
+    typically due to occlusion, glare, blur, or contrast. Showing them helps the
+    user understand 'something is there but we couldn't read it'.
+    """
+    for cand in candidates:
+        corners = cand.corners.astype(int).reshape(-1, 2)
+        cv2.polylines(
+            frame,
+            [corners],
+            isClosed=True,
+            color=CANDIDATE_COLOR,
+            thickness=1,
+            lineType=cv2.LINE_AA,
+        )
+        if label:
+            x, y, _, _ = cand.bbox
+            _label(frame, x, y, "stag?", CANDIDATE_COLOR)
     return frame
 
 

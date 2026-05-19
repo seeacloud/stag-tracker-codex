@@ -1,22 +1,25 @@
 from __future__ import annotations
 
 import argparse
+import json
 import time
 from collections import deque
 from dataclasses import replace
 from pathlib import Path
-from typing import Optional
+from typing import Optional, TextIO
 
 import cv2
 import numpy as np
 
 from .fusion import FusionTracker
-from .models import BBox, StagObservation, Track, clip_bbox
+from .models import BBox, StagCandidate, StagObservation, Track, clip_bbox
 from .optical_flow import OpticalFlowTracker
+from .preprocess import EnhanceConfig
 from .screen_mapper import ScreenMapper, draw_screen_observations, draw_screen_tracks
 from .stag_detector import CameraCalibration, StagDetector
 from .tuio_sender import TuioSender, tracks_to_tuio_objects
-from .visualization import draw_observations, draw_tracks
+from .visualization import draw_candidates, draw_observations, draw_tracks
+from .camera_picker import probe_cameras, print_cameras, pick_camera_gui, camera_backend
 
 
 def parse_args() -> argparse.Namespace:
@@ -67,11 +70,83 @@ def parse_args() -> argparse.Namespace:
         help="OpenCV camera backend on Windows.",
     )
     parser.add_argument("--log-every", type=int, default=120, help="Print average FPS every N frames. 0 disables logs.")
+    parser.add_argument("--log-jsonl", default=None, help="Append per-frame JSON lines with detection state to this file.")
+    parser.add_argument("--list-cameras", action="store_true", help="List detected cameras and exit.")
+    parser.add_argument("--pick-camera", action="store_true", help="Show a camera picker window before starting.")
+    parser.add_argument("--enhance-clahe", action="store_true", help="Apply CLAHE before STag detection (helps low-light/low-contrast).")
+    parser.add_argument("--clahe-clip", type=float, default=2.0, help="CLAHE clip limit. Higher boosts contrast more.")
+    parser.add_argument("--clahe-grid", type=int, default=8, help="CLAHE tile grid size (NxN).")
+    parser.add_argument(
+        "--enhance-sharpen",
+        action="store_true",
+        help="Apply unsharp-mask sharpening before STag (helps motion/focus blur).",
+    )
+    parser.add_argument("--sharpen-amount", type=float, default=1.0, help="Unsharp-mask strength (0=off, 1.0 default, 2.0 strong).")
+    parser.add_argument("--sharpen-radius", type=float, default=1.2, help="Unsharp-mask Gaussian sigma (pixels). Larger smooths a bigger neighbourhood.")
+    parser.add_argument("--sharpen-threshold", type=int, default=0, help="Skip pixels whose |orig-blur| <= threshold (suppresses noise amplification).")
+    parser.add_argument(
+        "--camera-exposure",
+        type=float,
+        default=None,
+        help="DSHOW exposure value, log2 seconds (e.g. -7 for ~1/128s). Lower = shorter exposure = less motion blur.",
+    )
+    parser.add_argument(
+        "--scales",
+        default="1.0",
+        help="Comma-separated detection scales, e.g. '0.75,1.0,1.5'. Multi-scale helps small/large markers.",
+    )
+    parser.add_argument(
+        "--roi-min-short-side",
+        type=int,
+        default=0,
+        help="If a detection ROI's short side is below this many pixels, super-resolve it before STag (0 disables).",
+    )
+    parser.add_argument(
+        "--show-candidates",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Draw blue boxes around STag-localized but undecoded quads.",
+    )
     return parser.parse_args()
+
+
+def parse_scales(spec: str) -> tuple[float, ...]:
+    values: list[float] = []
+    for token in spec.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        try:
+            value = float(token)
+        except ValueError as exc:
+            raise SystemExit(f"--scales contains invalid number: {token!r}") from exc
+        if value <= 0:
+            raise SystemExit(f"--scales must be positive, got {value}")
+        values.append(value)
+    if not values:
+        return (1.0,)
+    return tuple(values)
 
 
 def main() -> int:
     args = parse_args()
+
+    if args.list_cameras or args.pick_camera:
+        backend = camera_backend(args.camera_backend if args.camera_backend != "any" else "dshow")
+        cameras = probe_cameras(backend=backend)
+        if args.list_cameras:
+            print_cameras(cameras)
+            if not args.pick_camera:
+                return 0
+        if args.pick_camera:
+            if not cameras:
+                raise SystemExit("No cameras detected.")
+            picked = pick_camera_gui(cameras)
+            if picked is None:
+                raise SystemExit("Camera selection cancelled.")
+            args.source = str(picked)
+            print(f"Selected camera index {picked}")
+
     capture = open_capture(args)
     if not capture.isOpened():
         raise SystemExit(f"Could not open source: {args.source}")
@@ -99,6 +174,17 @@ def main() -> int:
         marker_size=args.marker_size,
         calibration=calibration,
         roi_padding=args.roi_padding,
+        enhance=EnhanceConfig(
+            clahe=args.enhance_clahe,
+            clahe_clip=args.clahe_clip,
+            clahe_grid=args.clahe_grid,
+            sharpen=args.enhance_sharpen,
+            sharpen_amount=args.sharpen_amount,
+            sharpen_radius=args.sharpen_radius,
+            sharpen_threshold=args.sharpen_threshold,
+        ),
+        scales=parse_scales(args.scales),
+        roi_min_short_side=args.roi_min_short_side,
     )
     flow = OpticalFlowTracker(
         max_corners=args.flow_points,
@@ -118,6 +204,10 @@ def main() -> int:
     last_time = start_time
     fps_window: deque[float] = deque(maxlen=120)
     previous_gray = None
+    jsonl_file: Optional[TextIO] = None
+    if args.log_jsonl:
+        Path(args.log_jsonl).parent.mkdir(parents=True, exist_ok=True)
+        jsonl_file = open(args.log_jsonl, "w", encoding="utf-8", buffering=1)
 
     try:
         while ok:
@@ -156,10 +246,17 @@ def main() -> int:
                 if args.mirror
                 else observations
             )
+            display_candidates = (
+                mirror_candidates_for_display(detector.last_candidates, frame.shape[1])
+                if args.mirror
+                else detector.last_candidates
+            )
 
             annotated = display_frame.copy()
             if screen_mapper is not None:
                 screen_mapper.draw_source_outline(annotated)
+            if args.show_candidates:
+                draw_candidates(annotated, display_candidates)
             if args.no_memory:
                 draw_observations(annotated, display_observations)
                 active_count = len(display_observations)
@@ -225,6 +322,29 @@ def main() -> int:
                     f"fps_loop={loop_fps:.1f} active={active_count} "
                     f"observed={len(observations)}"
                 )
+            if jsonl_file is not None:
+                record = {
+                    "frame": frame_index,
+                    "fps": round(fps, 2),
+                    "observed_ids": [int(o.marker_id) for o in observations],
+                    "candidates": [
+                        [int(c.bbox[0]), int(c.bbox[1]), int(c.bbox[2]), int(c.bbox[3])]
+                        for c in detector.last_candidates
+                    ],
+                    "tracks": [
+                        {
+                            "id": int(t.marker_id),
+                            "bbox": [int(v) for v in t.bbox],
+                            "missed": int(t.missed),
+                            "stag_missed": int(getattr(t, "stag_missed", 0)),
+                            "recognized": bool(
+                                getattr(t, "stag_missed", 0) <= args.visual_hold
+                            ),
+                        }
+                        for t in fusion.tracks
+                    ],
+                }
+                jsonl_file.write(json.dumps(record) + "\n")
             if args.max_frames and frame_index >= args.max_frames:
                 break
     finally:
@@ -236,6 +356,8 @@ def main() -> int:
         if tuio_sender is not None:
             tuio_sender.send([])
             tuio_sender.close()
+        if jsonl_file is not None:
+            jsonl_file.close()
         if args.show:
             cv2.destroyAllWindows()
 
@@ -250,14 +372,6 @@ def open_capture(args: argparse.Namespace) -> cv2.VideoCapture:
     return cv2.VideoCapture(args.source)
 
 
-def camera_backend(name: str) -> int:
-    if name == "dshow":
-        return cv2.CAP_DSHOW
-    if name == "msmf":
-        return cv2.CAP_MSMF
-    return cv2.CAP_ANY
-
-
 def configure_camera(capture: cv2.VideoCapture, args: argparse.Namespace) -> None:
     if args.camera_fourcc:
         if len(args.camera_fourcc) < 4:
@@ -269,6 +383,9 @@ def configure_camera(capture: cv2.VideoCapture, args: argparse.Namespace) -> Non
         capture.set(cv2.CAP_PROP_FRAME_HEIGHT, args.camera_height)
     if args.camera_fps:
         capture.set(cv2.CAP_PROP_FPS, args.camera_fps)
+    if args.camera_exposure is not None:
+        capture.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
+        capture.set(cv2.CAP_PROP_EXPOSURE, args.camera_exposure)
     capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
 
@@ -344,6 +461,19 @@ def mirror_observations_for_display(
             pose=observation.pose,
         )
         for observation in observations
+    ]
+
+
+def mirror_candidates_for_display(
+    candidates: list[StagCandidate],
+    width: int,
+) -> list[StagCandidate]:
+    return [
+        StagCandidate(
+            corners=mirror_points(candidate.corners, width),
+            bbox=mirror_bbox(candidate.bbox, width),
+        )
+        for candidate in candidates
     ]
 
 
