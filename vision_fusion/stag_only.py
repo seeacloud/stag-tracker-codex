@@ -60,15 +60,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", default=None, help="Optional annotated output video path.")
     parser.add_argument("--raw-output", default=None, help="Optional unannotated original-frame video (use for clean A/B replay).")
     parser.add_argument("--max-frames", type=int, default=0, help="Stop after N frames. 0 runs until the source ends.")
-    parser.add_argument("--camera-width", type=int, default=None, help="Requested camera capture width.")
-    parser.add_argument("--camera-height", type=int, default=None, help="Requested camera capture height.")
+    parser.add_argument("--camera-width", type=int, default=1280, help="Requested camera capture width (default 1280 = 720p).")
+    parser.add_argument("--camera-height", type=int, default=720, help="Requested camera capture height (default 720 = 720p).")
     parser.add_argument("--camera-fps", type=float, default=None, help="Requested camera capture FPS.")
-    parser.add_argument("--camera-fourcc", default=None, help="Requested camera FOURCC, for example MJPG.")
+    parser.add_argument("--camera-fourcc", default="MJPG", help="Requested camera FOURCC. Default MJPG enables 720p@30 on most USB webcams.")
     parser.add_argument(
         "--camera-backend",
         choices=("any", "dshow", "msmf"),
-        default="any",
-        help="OpenCV camera backend on Windows.",
+        default="dshow",
+        help="OpenCV camera backend on Windows. Default 'dshow' is required for stable MJPG 720p on this project's USB cam.",
     )
     parser.add_argument("--log-every", type=int, default=120, help="Print average FPS every N frames. 0 disables logs.")
     parser.add_argument("--log-jsonl", default=None, help="Append per-frame JSON lines with detection state to this file.")
@@ -79,8 +79,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--clahe-grid", type=int, default=8, help="CLAHE tile grid size (NxN).")
     parser.add_argument(
         "--enhance-sharpen",
-        action="store_true",
-        help="Apply unsharp-mask sharpening before STag (helps motion/focus blur).",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Apply unsharp-mask sharpening before STag (helps motion/focus blur). Default on for the aggressive pass.",
     )
     parser.add_argument("--sharpen-amount", type=float, default=1.0, help="Unsharp-mask strength (0=off, 1.0 default, 2.0 strong).")
     parser.add_argument("--sharpen-radius", type=float, default=1.2, help="Unsharp-mask Gaussian sigma (pixels). Larger smooths a bigger neighbourhood.")
@@ -110,22 +111,23 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--detect-passes",
-        default="",
+        default="3.5:0.75,1.0,1.5:140:off;4.5:0.6,1.0,2.0:100:on",
         help=(
             "Multi-pass detection spec, semicolon-separated. Each pass is "
-            "'clahe_clip:scales:roi_min_short_side[:sharpen]', e.g. "
-            "'3.5:0.75,1.0,1.5:140:off;4.5:1.0,2.0:100:on'. "
+            "'clahe_clip:scales:roi_min_short_side[:sharpen]'. "
+            "Default is the project's best 2-pass config (baseline + aggressive). "
             "Use 'off' for clahe_clip to disable CLAHE in that pass. "
             "Optional 4th field controls sharpen per pass: 'off' disables, "
             "'on' enables (using --sharpen-amount), or a number sets the amount. "
-            "Empty (default) keeps the legacy single-pass path using --enhance-clahe etc."
+            "Pass empty string ('') to fall back to the legacy single-pass path "
+            "using --enhance-clahe / --scales / --roi-min-short-side."
         ),
     )
     parser.add_argument(
         "--pass-workers",
         type=int,
-        default=1,
-        help="Thread pool size for multi-pass detection. 1 = serial, >1 = parallel passes.",
+        default=2,
+        help="Thread pool size for multi-pass detection. Default 2 matches the default 2-pass spec.",
     )
     parser.add_argument(
         "--expected-ids",
