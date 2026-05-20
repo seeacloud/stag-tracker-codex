@@ -112,9 +112,11 @@ def parse_args() -> argparse.Namespace:
         default="",
         help=(
             "Multi-pass detection spec, semicolon-separated. Each pass is "
-            "'clahe_clip:scales:roi_min_short_side', e.g. "
-            "'3.5:0.75,1.0,1.5:140;4.5:1.0,2.0:100'. "
+            "'clahe_clip:scales:roi_min_short_side[:sharpen]', e.g. "
+            "'3.5:0.75,1.0,1.5:140:off;4.5:1.0,2.0:100:on'. "
             "Use 'off' for clahe_clip to disable CLAHE in that pass. "
+            "Optional 4th field controls sharpen per pass: 'off' disables, "
+            "'on' enables (using --sharpen-amount), or a number sets the amount. "
             "Empty (default) keeps the legacy single-pass path using --enhance-clahe etc."
         ),
     )
@@ -148,8 +150,14 @@ def parse_scales(spec: str) -> tuple[float, ...]:
 def parse_passes(spec: str, base_enhance: EnhanceConfig) -> list[PassConfig]:
     """Parse a multi-pass spec like '3.5:0.75,1.0,1.5:140;4.5:1.0,2.0:100'.
 
-    Each pass: 'clahe_clip:scales:roi_min_short_side'. Use 'off' for clahe_clip
-    to disable CLAHE in that pass. Sharpen settings inherit from base_enhance.
+    Each pass: 'clahe_clip:scales:roi_min_short_side[:sharpen]'. Use 'off' for
+    clahe_clip to disable CLAHE in that pass. The optional 4th field controls
+    sharpen for that pass independently of the global --enhance-sharpen flag:
+      - omitted        → inherit base_enhance.sharpen (back-compat)
+      - 'off'          → sharpen disabled for this pass
+      - 'on'           → sharpen enabled, amount inherited from --sharpen-amount
+      - <float>        → sharpen enabled with that amount
+
     Returns [] if spec is empty (caller falls back to legacy single-pass path).
     """
     spec = (spec or "").strip()
@@ -161,12 +169,16 @@ def parse_passes(spec: str, base_enhance: EnhanceConfig) -> list[PassConfig]:
         if not chunk:
             continue
         parts = chunk.split(":")
-        if len(parts) != 3:
+        if len(parts) not in (3, 4):
             raise SystemExit(
-                f"--detect-passes pass {chunk!r} must have 3 fields "
-                f"'clahe_clip:scales:roi_min_short_side'"
+                f"--detect-passes pass {chunk!r} must have 3 or 4 fields "
+                f"'clahe_clip:scales:roi_min_short_side[:sharpen]'"
             )
-        clip_token, scales_token, min_token = (p.strip() for p in parts)
+        clip_token = parts[0].strip()
+        scales_token = parts[1].strip()
+        min_token = parts[2].strip()
+        sharpen_token = parts[3].strip() if len(parts) == 4 else None
+
         if clip_token.lower() == "off":
             clahe_on = False
             clahe_clip = base_enhance.clahe_clip
@@ -184,12 +196,32 @@ def parse_passes(spec: str, base_enhance: EnhanceConfig) -> list[PassConfig]:
             raise SystemExit(
                 f"--detect-passes roi_min_short_side must be int, got {min_token!r}"
             ) from exc
+
+        sharpen_on = base_enhance.sharpen
+        sharpen_amount = base_enhance.sharpen_amount
+        if sharpen_token is not None:
+            t = sharpen_token.lower()
+            if t == "off":
+                sharpen_on = False
+            elif t == "on":
+                sharpen_on = True
+            else:
+                try:
+                    sharpen_amount = float(sharpen_token)
+                except ValueError as exc:
+                    raise SystemExit(
+                        f"--detect-passes sharpen must be 'on'/'off' or a number, got {sharpen_token!r}"
+                    ) from exc
+                sharpen_on = True
+
         passes.append(
             PassConfig(
                 enhance=replace(
                     base_enhance,
                     clahe=clahe_on,
                     clahe_clip=clahe_clip,
+                    sharpen=sharpen_on,
+                    sharpen_amount=sharpen_amount,
                 ),
                 scales=parse_scales(scales_token),
                 roi_min_short_side=max(0, roi_min),
