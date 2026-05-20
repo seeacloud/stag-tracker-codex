@@ -74,14 +74,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-jsonl", default=None, help="Append per-frame JSON lines with detection state to this file.")
     parser.add_argument("--list-cameras", action="store_true", help="List detected cameras and exit.")
     parser.add_argument("--pick-camera", action="store_true", help="Show a camera picker window before starting.")
-    parser.add_argument("--enhance-clahe", action="store_true", help="Apply CLAHE before STag detection (helps low-light/low-contrast).")
-    parser.add_argument("--clahe-clip", type=float, default=2.0, help="CLAHE clip limit. Higher boosts contrast more.")
+    parser.add_argument(
+        "--enhance-clahe",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Apply CLAHE before STag detection (helps low-light/low-contrast). Default on so the 1-pass fallback is also a good config.",
+    )
+    parser.add_argument("--clahe-clip", type=float, default=3.5, help="CLAHE clip limit. Higher boosts contrast more. Default 3.5 is the verified best-1-pass value.")
     parser.add_argument("--clahe-grid", type=int, default=8, help="CLAHE tile grid size (NxN).")
     parser.add_argument(
         "--enhance-sharpen",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Apply unsharp-mask sharpening before STag (helps motion/focus blur). Default on for the aggressive pass.",
+        default=False,
+        help="Apply unsharp-mask sharpening before STag. Default off (net negative on 1-pass). Multi-pass uses the per-pass :on/:off field instead.",
     )
     parser.add_argument("--sharpen-amount", type=float, default=1.0, help="Unsharp-mask strength (0=off, 1.0 default, 2.0 strong).")
     parser.add_argument("--sharpen-radius", type=float, default=1.2, help="Unsharp-mask Gaussian sigma (pixels). Larger smooths a bigger neighbourhood.")
@@ -94,14 +99,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--scales",
-        default="1.0",
-        help="Comma-separated detection scales, e.g. '0.75,1.0,1.5'. Multi-scale helps small/large markers.",
+        default="0.75,1.0,1.5",
+        help="Comma-separated detection scales for the 1-pass fallback path, e.g. '0.75,1.0,1.5'. Default is the verified best-1-pass triplet. Ignored when --detect-passes is non-empty.",
     )
     parser.add_argument(
         "--roi-min-short-side",
         type=int,
-        default=0,
-        help="If a detection ROI's short side is below this many pixels, super-resolve it before STag (0 disables).",
+        default=140,
+        help="If a detection ROI's short side is below this many pixels, super-resolve it before STag (0 disables). Default 140 is the verified best-1-pass value. Ignored when --detect-passes is non-empty.",
     )
     parser.add_argument(
         "--show-candidates",
