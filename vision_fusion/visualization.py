@@ -69,17 +69,17 @@ def draw_tracks(frame: np.ndarray, tracks: list[Track], visual_hold: int = 0) ->
         visually_seen = track.detection_missed <= visual_hold
         state = track_display_state(track, visual_hold)
         color = track_color(track, visual_hold)
-        cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
+
+        if track.display_corners is not None and visually_seen:
+            corners = track.display_corners.astype(int).reshape(-1, 2)
+            cv2.polylines(frame, [corners], isClosed=True, color=color, thickness=2)
+
         label = (
             f"#{track.track_id} {track.label} "
             f"{track.confidence:.2f} {state} "
             f"miss:{track.missed} seenmiss:{track.detection_missed}"
         )
         _label(frame, x, y, label, color)
-
-        if track.display_corners is not None and visually_seen:
-            corners = track.display_corners.astype(int).reshape(-1, 2)
-            cv2.polylines(frame, [corners], isClosed=True, color=color, thickness=2)
 
         draw_track_history(frame, track, visual_hold)
     return frame
