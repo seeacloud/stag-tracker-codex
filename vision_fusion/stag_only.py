@@ -15,6 +15,7 @@ from .fusion import FusionTracker
 from .models import BBox, StagCandidate, StagObservation, Track, clip_bbox
 from .optical_flow import OpticalFlowTracker
 from .preprocess import EnhanceConfig
+from .async_detector import AsyncDetector
 from .screen_mapper import ScreenMapper, draw_screen_observations, draw_screen_tracks
 from .stag_detector import CameraCalibration, PassConfig, StagDetector
 from .tuio_sender import TuioSender, tracks_to_tuio_objects
@@ -44,7 +45,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tuio-port", type=int, default=3333, help="TUIO UDP target port.")
     parser.add_argument("--tuio-source", default="vision_fusion", help="TUIO source name.")
     parser.add_argument("--no-memory", action="store_true", help="Disable optical-flow memory tracking.")
-    parser.add_argument("--detect-interval", type=int, default=1, help="Run STag detection every N frames.")
+    parser.add_argument("--detect-interval", type=int, default=1, help="Submit detection every N frames. Default 1 = every frame (async pipeline handles throughput).")
     parser.add_argument("--reacquire-interval", type=int, default=30, help="Run a full-frame search every N frames.")
     parser.add_argument("--fallback-full-interval", type=int, default=5, help="Add a full-screen/screen-map ROI every N frames while tracking.")
     parser.add_argument("--search-padding", type=int, default=80, help="Pixels around remembered tracks for STag reacquisition.")
@@ -131,8 +132,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--pass-workers",
         type=int,
-        default=2,
-        help="Thread pool size for multi-pass detection. Default 2 matches the default 2-pass spec.",
+        default=6,
+        help="Process pool size for parallel detection. Default 6 matches 2-pass × 3-scale.",
     )
     parser.add_argument(
         "--expected-ids",
@@ -332,6 +333,12 @@ def main() -> int:
         pass_workers=args.pass_workers,
         expected_ids=expected_ids,
     )
+    async_det = AsyncDetector(
+        library_hd=args.stag_library,
+        roi_padding=args.roi_padding,
+        passes=detect_passes or detector.passes,
+        workers=args.pass_workers,
+    )
     flow = OpticalFlowTracker(
         max_corners=args.flow_points,
         min_points=args.flow_min_points,
@@ -355,28 +362,48 @@ def main() -> int:
         Path(args.log_jsonl).parent.mkdir(parents=True, exist_ok=True)
         jsonl_file = open(args.log_jsonl, "w", encoding="utf-8", buffering=1)
 
+    profile_accum: dict[str, float] = {
+        "gray": 0.0, "flow": 0.0, "detect": 0.0,
+        "fusion": 0.0, "viz": 0.0, "display": 0.0,
+    }
+    profile_count = 0
+    profile_interval = args.log_every or 120
+
     try:
         while ok:
+            t0 = time.perf_counter()
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            t1 = time.perf_counter()
+
             predicted = False
             updated = False
             if not args.no_memory and previous_gray is not None and fusion.tracks:
                 fusion.predict(previous_gray, gray)
                 predicted = True
+            t2 = time.perf_counter()
 
             observations = []
-            should_detect = frame_index % max(1, args.detect_interval) == 0
-            if should_detect:
-                rois = detection_rois(frame, fusion.tracks, args, frame_index, screen_mapper)
-                observations = detector.detect(frame, rois=rois)
+            # Poll for completed detection results FIRST (non-blocking)
+            async_result = async_det.try_get_results()
+            if async_result is not None:
+                observations, new_candidates = async_result
+                detector.last_candidates = new_candidates
                 if not args.no_memory:
                     fusion.update(gray, [], observations)
                     updated = True
 
+            # Then submit next frame for detection (non-blocking)
+            should_detect = frame_index % max(1, args.detect_interval) == 0
+            if should_detect:
+                rois = detection_rois(frame, fusion.tracks, args, frame_index, screen_mapper)
+                async_det.submit(frame, rois)
+            t3 = time.perf_counter()
+
             if not args.no_memory and predicted and not updated:
                 fusion.record_predicted_history()
+            t4 = time.perf_counter()
 
-            now = time.perf_counter()
+            now = t4
             fps = 1.0 / max(now - last_time, 1e-6)
             last_time = now
             fps_window.append(fps)
@@ -440,6 +467,7 @@ def main() -> int:
                 draw_screen_status(screen_view, fps, active_count)
                 if screen_writer is not None:
                     screen_writer.write(screen_view)
+            t5 = time.perf_counter()
 
             if tuio_sender is not None:
                 tuio_sender.send(
@@ -457,19 +485,40 @@ def main() -> int:
                 key = cv2.waitKeyEx(1)
                 if handle_key(key, fusion, args.smooth_step):
                     break
+            t6 = time.perf_counter()
+
+            profile_accum["gray"] += t1 - t0
+            profile_accum["flow"] += t2 - t1
+            profile_accum["detect"] += t3 - t2
+            profile_accum["fusion"] += t4 - t3
+            profile_accum["viz"] += t5 - t4
+            profile_accum["display"] += t6 - t5
+            profile_count += 1
 
             ok, frame = capture.read()
             previous_gray = gray
             frame_index += 1
-            if args.log_every and frame_index % args.log_every == 0 and fps_window:
+            if profile_interval and frame_index % profile_interval == 0 and fps_window:
                 elapsed = max(time.perf_counter() - start_time, 1e-6)
                 wall_fps = frame_index / elapsed
                 loop_fps = sum(fps_window) / len(fps_window)
+                n = max(profile_count, 1)
+                avg = {k: v / n * 1000 for k, v in profile_accum.items()}
+                total_ms = sum(avg.values())
                 print(
                     f"frame={frame_index} fps_wall={wall_fps:.1f} "
                     f"fps_loop={loop_fps:.1f} active={active_count} "
                     f"observed={len(observations)}"
                 )
+                print(
+                    f"  profile (avg ms): "
+                    f"gray={avg['gray']:.1f} flow={avg['flow']:.1f} "
+                    f"detect={avg['detect']:.1f} fusion={avg['fusion']:.1f} "
+                    f"viz={avg['viz']:.1f} display={avg['display']:.1f} "
+                    f"total={total_ms:.1f}"
+                )
+                profile_accum = {k: 0.0 for k in profile_accum}
+                profile_count = 0
             if jsonl_file is not None:
                 record = {
                     "frame": frame_index,
@@ -497,6 +546,8 @@ def main() -> int:
             if args.max_frames and frame_index >= args.max_frames:
                 break
     finally:
+        async_det.close()
+        detector.close()
         capture.release()
         if writer is not None:
             writer.release()
@@ -746,4 +797,6 @@ def clamp(value: float, low: float, high: float) -> float:
 
 
 if __name__ == "__main__":
+    import multiprocessing
+    multiprocessing.freeze_support()
     raise SystemExit(main())

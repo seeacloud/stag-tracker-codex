@@ -40,7 +40,6 @@ class FusionTracker:
             for track in self.tracks
         ]
         for track in self.tracks:
-            track.detection_missed += 1
             self._stabilize_track(track)
         self._merge_duplicate_marker_tracks()
         self._drop_stale()
@@ -251,6 +250,7 @@ class FusionTracker:
     def _record_unmatched_history(self, matched_track_ids: set[int]) -> None:
         for track in self.tracks:
             if track.track_id not in matched_track_ids:
+                track.detection_missed += 1
                 append_track_history(track)
 
     def _merge_duplicate_marker_tracks(self) -> None:

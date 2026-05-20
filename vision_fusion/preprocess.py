@@ -17,6 +17,17 @@ class EnhanceConfig:
     sharpen_radius: float = 1.2
     sharpen_threshold: int = 0
 
+    def to_dict(self) -> dict:
+        return {
+            "clahe": self.clahe,
+            "clahe_clip": self.clahe_clip,
+            "clahe_grid": self.clahe_grid,
+            "sharpen": self.sharpen,
+            "sharpen_amount": self.sharpen_amount,
+            "sharpen_radius": self.sharpen_radius,
+            "sharpen_threshold": self.sharpen_threshold,
+        }
+
 
 def apply_clahe(image: np.ndarray, clip: float = 2.0, grid: int = 8) -> np.ndarray:
     """Apply CLAHE for low-contrast / low-light recovery.

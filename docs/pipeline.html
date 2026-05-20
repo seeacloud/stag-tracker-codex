@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>STag Tracker Pipeline</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: -apple-system, 'Segoe UI', sans-serif; background: #1a1a2e; color: #eee; padding: 40px; }
+h1 { text-align: center; margin-bottom: 30px; font-size: 1.6em; color: #7fdbca; }
+.pipeline { display: flex; flex-direction: column; align-items: center; gap: 0; max-width: 1100px; margin: 0 auto; }
+.arrow { width: 2px; height: 28px; background: #555; position: relative; }
+.arrow::after { content: ''; position: absolute; bottom: -6px; left: -5px; border-left: 6px solid transparent; border-right: 6px solid transparent; border-top: 8px solid #555; }
+.arrow-branch { display: flex; align-items: flex-start; gap: 0; }
+.node { border-radius: 10px; padding: 14px 22px; text-align: center; min-width: 220px; max-width: 420px; font-size: 0.88em; line-height: 1.5; }
+.node b { display: block; font-size: 1.05em; margin-bottom: 4px; }
+.node code { background: rgba(255,255,255,0.1); padding: 1px 5px; border-radius: 3px; font-size: 0.85em; }
+.capture { background: #16213e; border: 2px solid #0f3460; }
+.preprocess { background: #1a1a3e; border: 2px solid #4a3f8a; }
+.detect { background: #0f3460; border: 2px solid #1a8fdd; }
+.pass { background: #1b2a4a; border: 2px dashed #3a7bd5; }
+.fusion { background: #1a3a2e; border: 2px solid #2ecc71; }
+.output { background: #2d1b3e; border: 2px solid #9b59b6; }
+.decision { background: #3a2a1a; border: 2px solid #e67e22; transform: rotate(0deg); }
+.parallel-box { display: flex; gap: 20px; align-items: flex-start; justify-content: center; flex-wrap: wrap; }
+.parallel-box .node { min-width: 180px; max-width: 280px; }
+.section-label { color: #888; font-size: 0.75em; text-transform: uppercase; letter-spacing: 1px; margin-top: 10px; }
+.highlight { color: #7fdbca; }
+.dim { color: #888; }
+.branch-container { display: flex; gap: 30px; align-items: flex-start; justify-content: center; }
+.branch { display: flex; flex-direction: column; align-items: center; gap: 0; }
+</style>
+</head>
+<body>
+<h1>STag Tracker — Processing Pipeline</h1>
+
+<div class="pipeline">
+
+<!-- 1. Capture -->
+<div class="section-label">Stage 1: Capture</div>
+<div class="node capture">
+  <b>Camera Capture</b>
+  USB cam via DirectShow<br>
+  <code>1280×720 MJPG</code><br>
+  <span class="dim">cv2.VideoCapture → BGR frame</span>
+</div>
+<div class="arrow"></div>
+
+<!-- 2. Grayscale -->
+<div class="node preprocess">
+  <b>BGR → Grayscale</b>
+  <code>cv2.cvtColor(COLOR_BGR2GRAY)</code><br>
+  <span class="dim">gray 用于光流跟踪</span>
+</div>
+<div class="arrow"></div>
+
+<!-- 3. Optical Flow Predict -->
+<div class="node fusion">
+  <b>Optical Flow Predict</b>
+  <code>OpticalFlowTracker.update_track()</code><br>
+  用前一帧 gray 和当前 gray 预测已有 track 的新位置<br>
+  <span class="dim">Lucas-Kanade 稀疏光流 (120 pts/marker)</span>
+</div>
+<div class="arrow"></div>
+
+<!-- 4. ROI Decision -->
+<div class="node decision">
+  <b>ROI 决策</b>
+  <span class="dim">detection_rois()</span><br>
+  • 无 track / 每 N 帧 → 全帧搜索<br>
+  • 有 track → 各 track bbox + padding<br>
+  • 每 5 帧追加一次全帧 fallback
+</div>
+<div class="arrow"></div>
+
+<!-- 5. Multi-Pass Detection -->
+<div class="section-label">Stage 2: Multi-Pass Detection (per ROI)</div>
+<div class="node detect">
+  <b>StagDetector.detect(frame, rois)</b>
+  <span class="dim">自适应：若 baseline 已覆盖 expected_ids → 跳过后续 pass</span>
+</div>
+<div class="arrow"></div>
+
+<!-- Parallel passes -->
+<div class="parallel-box">
+  <div class="branch">
+    <div class="node pass">
+      <b>Pass 0 — Baseline</b>
+      CLAHE clip=3.5, grid=8<br>
+      Sharpen: <span style="color:#e74c3c">OFF</span><br>
+      Scales: 0.75, 1.0, 1.5<br>
+      ROI super-res: min 140px
+    </div>
+  </div>
+  <div class="branch">
+    <div class="node pass">
+      <b>Pass 1 — Aggressive</b>
+      CLAHE clip=4.5, grid=8<br>
+      Sharpen: <span style="color:#2ecc71">ON</span> (amount=1.0)<br>
+      Scales: 0.6, 1.0, 2.0<br>
+      ROI super-res: min 100px
+    </div>
+  </div>
+</div>
+<div class="arrow"></div>
+
+<!-- Per-pass internals -->
+<div class="node preprocess">
+  <b>每个 Pass 内部流程</b>
+  ① <code>enhance_for_detection(crop, config)</code> — CLAHE / Sharpen<br>
+  ② 对每个 scale 缩放图像<br>
+  ③ <code>stag.detectMarkers(scaled, libraryHD=17)</code><br>
+  ④ 角点坐标反缩放 + 偏移回原图坐标
+</div>
+<div class="arrow"></div>
+
+<!-- 6. Union + Dedupe -->
+<div class="node detect">
+  <b>Union + Dedupe</b>
+  合并所有 pass 的 observations<br>
+  <code>dedupe_observations(iou > 0.1)</code><br>
+  <span class="dim">同 marker_id + 高 IoU → 保留大 bbox 那个</span><br>
+  <code>filter_candidates()</code> 去掉已识别区域的 rejected quads
+</div>
+<div class="arrow"></div>
+
+<!-- 7. Fusion Tracker -->
+<div class="section-label">Stage 3: Tracking & Fusion</div>
+<div class="node fusion">
+  <b>FusionTracker.update()</b>
+  ① IoU 匹配 observations → 已有 tracks<br>
+  ② 匹配成功 → 更新 bbox/corners/missed=0<br>
+  ③ 未匹配 observation → 创建新 track<br>
+  ④ 未匹配 track → missed++<br>
+  ⑤ missed > max_missed → 删除 track<br>
+  <span class="dim">display smoothing: EMA alpha + deadband + snap</span>
+</div>
+<div class="arrow"></div>
+
+<!-- 8. Output -->
+<div class="section-label">Stage 4: Output</div>
+<div class="parallel-box">
+  <div class="node output">
+    <b>可视化</b>
+    Quad polyline (绿/橙/紫)<br>
+    Candidate "stag?" 蓝框<br>
+    轨迹历史线 (颜色=状态)<br>
+    <code>cv2.imshow / VideoWriter</code>
+  </div>
+  <div class="node output">
+    <b>JSONL 日志</b>
+    每帧: frame, fps,<br>
+    observed_ids, skipped_passes,<br>
+    candidates, tracks<br>
+    <code>--log-jsonl path</code>
+  </div>
+  <div class="node output">
+    <b>TUIO 1.1</b>
+    UDP /tuio/2Dobj<br>
+    marker_id → angle/position<br>
+    <code>--tuio --tuio-port 3333</code>
+  </div>
+  <div class="node output">
+    <b>Screen Map</b>
+    透视变换到屏幕坐标<br>
+    独立窗口 + 视频输出<br>
+    <code>--screen-map npz</code>
+  </div>
+</div>
+
+</div><!-- /pipeline -->
+
+<div style="margin-top: 50px; text-align: center; color: #555; font-size: 0.8em;">
+  stag-tracker-codex · 2026-05-20 · Pipeline: capture → multi-pass detect → fusion track → output
+</div>
+</body>
+</html>
