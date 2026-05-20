@@ -16,7 +16,7 @@ from .models import BBox, StagCandidate, StagObservation, Track, clip_bbox
 from .optical_flow import OpticalFlowTracker
 from .preprocess import EnhanceConfig
 from .screen_mapper import ScreenMapper, draw_screen_observations, draw_screen_tracks
-from .stag_detector import CameraCalibration, StagDetector
+from .stag_detector import CameraCalibration, PassConfig, StagDetector
 from .tuio_sender import TuioSender, tracks_to_tuio_objects
 from .visualization import draw_candidates, draw_observations, draw_tracks
 from .camera_picker import probe_cameras, print_cameras, pick_camera_gui, camera_backend
@@ -107,6 +107,23 @@ def parse_args() -> argparse.Namespace:
         default=True,
         help="Draw blue boxes around STag-localized but undecoded quads.",
     )
+    parser.add_argument(
+        "--detect-passes",
+        default="",
+        help=(
+            "Multi-pass detection spec, semicolon-separated. Each pass is "
+            "'clahe_clip:scales:roi_min_short_side', e.g. "
+            "'3.5:0.75,1.0,1.5:140;4.5:1.0,2.0:100'. "
+            "Use 'off' for clahe_clip to disable CLAHE in that pass. "
+            "Empty (default) keeps the legacy single-pass path using --enhance-clahe etc."
+        ),
+    )
+    parser.add_argument(
+        "--pass-workers",
+        type=int,
+        default=1,
+        help="Thread pool size for multi-pass detection. 1 = serial, >1 = parallel passes.",
+    )
     return parser.parse_args()
 
 
@@ -126,6 +143,61 @@ def parse_scales(spec: str) -> tuple[float, ...]:
     if not values:
         return (1.0,)
     return tuple(values)
+
+
+def parse_passes(spec: str, base_enhance: EnhanceConfig) -> list[PassConfig]:
+    """Parse a multi-pass spec like '3.5:0.75,1.0,1.5:140;4.5:1.0,2.0:100'.
+
+    Each pass: 'clahe_clip:scales:roi_min_short_side'. Use 'off' for clahe_clip
+    to disable CLAHE in that pass. Sharpen settings inherit from base_enhance.
+    Returns [] if spec is empty (caller falls back to legacy single-pass path).
+    """
+    spec = (spec or "").strip()
+    if not spec:
+        return []
+    passes: list[PassConfig] = []
+    for chunk in spec.split(";"):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        parts = chunk.split(":")
+        if len(parts) != 3:
+            raise SystemExit(
+                f"--detect-passes pass {chunk!r} must have 3 fields "
+                f"'clahe_clip:scales:roi_min_short_side'"
+            )
+        clip_token, scales_token, min_token = (p.strip() for p in parts)
+        if clip_token.lower() == "off":
+            clahe_on = False
+            clahe_clip = base_enhance.clahe_clip
+        else:
+            try:
+                clahe_clip = float(clip_token)
+            except ValueError as exc:
+                raise SystemExit(
+                    f"--detect-passes clahe_clip must be a number or 'off', got {clip_token!r}"
+                ) from exc
+            clahe_on = True
+        try:
+            roi_min = int(min_token)
+        except ValueError as exc:
+            raise SystemExit(
+                f"--detect-passes roi_min_short_side must be int, got {min_token!r}"
+            ) from exc
+        passes.append(
+            PassConfig(
+                enhance=replace(
+                    base_enhance,
+                    clahe=clahe_on,
+                    clahe_clip=clahe_clip,
+                ),
+                scales=parse_scales(scales_token),
+                roi_min_short_side=max(0, roi_min),
+            )
+        )
+    if not passes:
+        raise SystemExit("--detect-passes parsed to zero passes")
+    return passes
 
 
 def main() -> int:
@@ -169,22 +241,26 @@ def main() -> int:
         else None
     )
     calibration = load_calibration(args.calibration)
+    base_enhance = EnhanceConfig(
+        clahe=args.enhance_clahe,
+        clahe_clip=args.clahe_clip,
+        clahe_grid=args.clahe_grid,
+        sharpen=args.enhance_sharpen,
+        sharpen_amount=args.sharpen_amount,
+        sharpen_radius=args.sharpen_radius,
+        sharpen_threshold=args.sharpen_threshold,
+    )
+    detect_passes = parse_passes(args.detect_passes, base_enhance)
     detector = StagDetector(
         library_hd=args.stag_library,
         marker_size=args.marker_size,
         calibration=calibration,
         roi_padding=args.roi_padding,
-        enhance=EnhanceConfig(
-            clahe=args.enhance_clahe,
-            clahe_clip=args.clahe_clip,
-            clahe_grid=args.clahe_grid,
-            sharpen=args.enhance_sharpen,
-            sharpen_amount=args.sharpen_amount,
-            sharpen_radius=args.sharpen_radius,
-            sharpen_threshold=args.sharpen_threshold,
-        ),
+        enhance=base_enhance,
         scales=parse_scales(args.scales),
         roi_min_short_side=args.roi_min_short_side,
+        passes=detect_passes or None,
+        pass_workers=args.pass_workers,
     )
     flow = OpticalFlowTracker(
         max_corners=args.flow_points,

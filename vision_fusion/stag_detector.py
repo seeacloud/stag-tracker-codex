@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 from typing import Optional
 
 import cv2
@@ -33,6 +34,20 @@ class CameraCalibration:
         )
 
 
+@dataclass(slots=True)
+class PassConfig:
+    """One detection pass: a full set of preprocessing + scaling parameters.
+
+    Multi-pass detection re-runs STag on the same frame with each PassConfig
+    in order and unions the results. Use it to combine a fast 'normal' pass
+    with one or more aggressive passes that recover dim / small markers.
+    """
+
+    enhance: EnhanceConfig = field(default_factory=EnhanceConfig)
+    scales: tuple[float, ...] = (1.0,)
+    roi_min_short_side: int = 0
+
+
 class StagDetector:
     def __init__(
         self,
@@ -43,6 +58,8 @@ class StagDetector:
         enhance: Optional[EnhanceConfig] = None,
         scales: Optional[tuple[float, ...]] = None,
         roi_min_short_side: int = 0,
+        passes: Optional[list[PassConfig]] = None,
+        pass_workers: int = 1,
     ) -> None:
         try:
             import stag
@@ -57,10 +74,58 @@ class StagDetector:
         self.marker_size = marker_size
         self.calibration = calibration
         self.roi_padding = roi_padding
-        self.enhance = enhance or EnhanceConfig()
-        self.scales = tuple(scales) if scales else (1.0,)
-        self.roi_min_short_side = max(0, int(roi_min_short_side))
+        if passes:
+            self.passes = list(passes)
+        else:
+            self.passes = [
+                PassConfig(
+                    enhance=enhance or EnhanceConfig(),
+                    scales=tuple(scales) if scales else (1.0,),
+                    roi_min_short_side=max(0, int(roi_min_short_side)),
+                )
+            ]
         self.last_candidates: list[StagCandidate] = []
+
+        workers = max(1, int(pass_workers))
+        # Cap at len(passes) — extra workers can't help since each pass is one task.
+        self._pass_workers = min(workers, len(self.passes))
+        self._executor: Optional[ThreadPoolExecutor] = (
+            ThreadPoolExecutor(max_workers=self._pass_workers, thread_name_prefix="stag-pass")
+            if self._pass_workers > 1
+            else None
+        )
+
+    def close(self) -> None:
+        """Tear down the per-pass thread pool, if any. Idempotent."""
+        if self._executor is not None:
+            self._executor.shutdown(wait=False, cancel_futures=True)
+            self._executor = None
+
+    def __del__(self) -> None:  # best-effort cleanup
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def _run_pass(
+        self,
+        frame: np.ndarray,
+        rois: list[BBox],
+        pass_cfg: PassConfig,
+    ) -> tuple[list[StagObservation], list[StagCandidate]]:
+        """Run a single PassConfig across all rois. Pure function — safe to parallelise."""
+        height, width = frame.shape[:2]
+        observations: list[StagObservation] = []
+        candidates: list[StagCandidate] = []
+        for roi in rois:
+            x, y, w, h = clip_bbox(roi, width, height, self.roi_padding)
+            if w <= 4 or h <= 4:
+                continue
+            crop = frame[y : y + h, x : x + w]
+            crop_obs, crop_cand = self._detect_crop(crop, x, y, pass_cfg)
+            observations.extend(crop_obs)
+            candidates.extend(crop_cand)
+        return observations, candidates
 
     def detect(
         self,
@@ -71,17 +136,19 @@ class StagDetector:
         if rois is None or not rois:
             rois = [(0, 0, width, height)]
 
+        if self._executor is not None and len(self.passes) > 1:
+            futures = [
+                self._executor.submit(self._run_pass, frame, rois, pass_cfg)
+                for pass_cfg in self.passes
+            ]
+            pass_results = [f.result() for f in futures]
+        else:
+            pass_results = [self._run_pass(frame, rois, pass_cfg) for pass_cfg in self.passes]
+
         observations: list[StagObservation] = []
         candidates: list[StagCandidate] = []
         seen: set[tuple[int, int, int]] = set()
-
-        for roi in rois:
-            x, y, w, h = clip_bbox(roi, width, height, self.roi_padding)
-            if w <= 4 or h <= 4:
-                continue
-
-            crop = frame[y : y + h, x : x + w]
-            crop_obs, crop_candidates = self._detect_crop(crop, x, y)
+        for crop_obs, crop_candidates in pass_results:
             for obs in crop_obs:
                 key = (obs.marker_id, int(obs.bbox[0]), int(obs.bbox[1]))
                 if key in seen:
@@ -99,11 +166,12 @@ class StagDetector:
         crop: np.ndarray,
         offset_x: int,
         offset_y: int,
+        pass_cfg: PassConfig,
     ) -> tuple[list[StagObservation], list[StagCandidate]]:
-        prepared = enhance_for_detection(crop, self.enhance)
+        prepared = enhance_for_detection(crop, pass_cfg.enhance)
         observations: list[StagObservation] = []
         candidates: list[StagCandidate] = []
-        scales = self._effective_scales(prepared)
+        scales = self._effective_scales(prepared, pass_cfg)
         for scale in scales:
             scaled = self._scale_image(prepared, scale)
             if scaled is None:
@@ -119,21 +187,26 @@ class StagDetector:
                 )
         return observations, candidates
 
-    def _effective_scales(self, image: np.ndarray) -> tuple[float, ...]:
-        if self.roi_min_short_side <= 0:
-            return self.scales
+    def _effective_scales(
+        self,
+        image: np.ndarray,
+        pass_cfg: PassConfig,
+    ) -> tuple[float, ...]:
+        base = pass_cfg.scales
+        if pass_cfg.roi_min_short_side <= 0:
+            return base
         h, w = image.shape[:2]
         short = min(h, w)
-        if short <= 0 or short >= self.roi_min_short_side:
-            return self.scales
-        boost = self.roi_min_short_side / float(short)
+        if short <= 0 or short >= pass_cfg.roi_min_short_side:
+            return base
+        boost = pass_cfg.roi_min_short_side / float(short)
         if boost <= 1.0:
-            return self.scales
-        boosted = tuple(s * boost for s in self.scales)
+            return base
+        boosted = tuple(s * boost for s in base)
         # Keep duplicates rare while preserving ordering.
         seen: set[float] = set()
         merged: list[float] = []
-        for s in (*self.scales, *boosted):
+        for s in (*base, *boosted):
             key = round(s, 4)
             if key in seen:
                 continue
