@@ -127,6 +127,16 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help="Thread pool size for multi-pass detection. 1 = serial, >1 = parallel passes.",
     )
+    parser.add_argument(
+        "--expected-ids",
+        default="",
+        help=(
+            "Comma-separated marker ids that should be in the scene, e.g. '0,1,2,10,150'. "
+            "When set, multi-pass detection skips later (slower) passes whenever the "
+            "first pass already finds all of them. Recovers FPS in static scenes "
+            "without sacrificing recognition rate."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -146,6 +156,23 @@ def parse_scales(spec: str) -> tuple[float, ...]:
     if not values:
         return (1.0,)
     return tuple(values)
+
+
+def parse_expected_ids(spec: str) -> Optional[set[int]]:
+    """Parse '0,1,2,10,150' -> {0,1,2,10,150}. Empty -> None (adaptive disabled)."""
+    spec = (spec or "").strip()
+    if not spec:
+        return None
+    out: set[int] = set()
+    for token in spec.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        try:
+            out.add(int(token))
+        except ValueError as exc:
+            raise SystemExit(f"--expected-ids contains non-integer: {token!r}") from exc
+    return out or None
 
 
 def parse_passes(spec: str, base_enhance: EnhanceConfig) -> list[PassConfig]:
@@ -285,6 +312,7 @@ def main() -> int:
         sharpen_threshold=args.sharpen_threshold,
     )
     detect_passes = parse_passes(args.detect_passes, base_enhance)
+    expected_ids = parse_expected_ids(args.expected_ids)
     detector = StagDetector(
         library_hd=args.stag_library,
         marker_size=args.marker_size,
@@ -295,6 +323,7 @@ def main() -> int:
         roi_min_short_side=args.roi_min_short_side,
         passes=detect_passes or None,
         pass_workers=args.pass_workers,
+        expected_ids=expected_ids,
     )
     flow = OpticalFlowTracker(
         max_corners=args.flow_points,
@@ -439,6 +468,7 @@ def main() -> int:
                     "frame": frame_index,
                     "fps": round(fps, 2),
                     "observed_ids": [int(o.marker_id) for o in observations],
+                    "skipped_passes": int(getattr(detector, "last_skipped_passes", 0)),
                     "candidates": [
                         [int(c.bbox[0]), int(c.bbox[1]), int(c.bbox[2]), int(c.bbox[3])]
                         for c in detector.last_candidates

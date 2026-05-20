@@ -60,6 +60,7 @@ class StagDetector:
         roi_min_short_side: int = 0,
         passes: Optional[list[PassConfig]] = None,
         pass_workers: int = 1,
+        expected_ids: Optional[set[int]] = None,
     ) -> None:
         try:
             import stag
@@ -85,6 +86,10 @@ class StagDetector:
                 )
             ]
         self.last_candidates: list[StagCandidate] = []
+        self.expected_ids: Optional[frozenset[int]] = (
+            frozenset(int(i) for i in expected_ids) if expected_ids else None
+        )
+        self.last_skipped_passes: int = 0
 
         workers = max(1, int(pass_workers))
         # Cap at len(passes) — extra workers can't help since each pass is one task.
@@ -136,14 +141,41 @@ class StagDetector:
         if rois is None or not rois:
             rois = [(0, 0, width, height)]
 
-        if self._executor is not None and len(self.passes) > 1:
+        self.last_skipped_passes = 0
+
+        # Single-pass fast path — also covers `len(self.passes) == 1` after the
+        # adaptive short-circuit below.
+        if len(self.passes) == 1:
+            crop_obs, crop_candidates = self._run_pass(frame, rois, self.passes[0])
+            deduped = dedupe_observations(crop_obs)
+            self.last_candidates = filter_candidates(crop_candidates, deduped)
+            return deduped
+
+        # Run baseline pass first (always serial). If expected_ids is set and
+        # the baseline already covers it, skip the remaining (typically slower)
+        # passes — the adaptive fast path. Monotonicity holds because the
+        # skipped-path result equals the baseline pass result, which is by
+        # construction a strict superset of the legacy 1-pass output.
+        baseline_obs, baseline_cands = self._run_pass(frame, rois, self.passes[0])
+        if self.expected_ids is not None:
+            seen_ids = {obs.marker_id for obs in baseline_obs}
+            if self.expected_ids.issubset(seen_ids):
+                self.last_skipped_passes = len(self.passes) - 1
+                deduped = dedupe_observations(baseline_obs)
+                self.last_candidates = filter_candidates(baseline_cands, deduped)
+                return deduped
+
+        # Run remaining passes (in parallel if executor available).
+        remaining = self.passes[1:]
+        if self._executor is not None and len(remaining) >= 1:
             futures = [
                 self._executor.submit(self._run_pass, frame, rois, pass_cfg)
-                for pass_cfg in self.passes
+                for pass_cfg in remaining
             ]
-            pass_results = [f.result() for f in futures]
+            tail_results = [f.result() for f in futures]
         else:
-            pass_results = [self._run_pass(frame, rois, pass_cfg) for pass_cfg in self.passes]
+            tail_results = [self._run_pass(frame, rois, pass_cfg) for pass_cfg in remaining]
+        pass_results = [(baseline_obs, baseline_cands), *tail_results]
 
         observations: list[StagObservation] = []
         candidates: list[StagCandidate] = []
