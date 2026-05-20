@@ -58,6 +58,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--smooth-step", type=float, default=0.05, help="Keyboard step for live smoothing changes.")
     parser.add_argument("--show", action="store_true", help="Show annotated frames.")
     parser.add_argument("--output", default=None, help="Optional annotated output video path.")
+    parser.add_argument("--raw-output", default=None, help="Optional unannotated original-frame video (use for clean A/B replay).")
     parser.add_argument("--max-frames", type=int, default=0, help="Stop after N frames. 0 runs until the source ends.")
     parser.add_argument("--camera-width", type=int, default=None, help="Requested camera capture width.")
     parser.add_argument("--camera-height", type=int, default=None, help="Requested camera capture height.")
@@ -261,6 +262,7 @@ def main() -> int:
 
     height, width = frame.shape[:2]
     writer = build_writer(args.output, capture, width, height) if args.output else None
+    raw_writer = build_writer(args.raw_output, capture, width, height) if args.raw_output else None
     screen_mapper = ScreenMapper.load(args.screen_map) if args.screen_map else None
     screen_writer = (
         build_fixed_writer(args.screen_output, capture, screen_mapper.output_size)
@@ -383,6 +385,8 @@ def main() -> int:
 
             if writer is not None:
                 writer.write(annotated)
+            if raw_writer is not None:
+                raw_writer.write(frame)
 
             screen_view = None
             if screen_mapper is not None:
@@ -459,6 +463,8 @@ def main() -> int:
         capture.release()
         if writer is not None:
             writer.release()
+        if raw_writer is not None:
+            raw_writer.release()
         if screen_writer is not None:
             screen_writer.release()
         if tuio_sender is not None:
