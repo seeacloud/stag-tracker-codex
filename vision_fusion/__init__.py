@@ -2,6 +2,7 @@
 
 __all__ = [
     "fusion",
+    "kalman_predictor",
     "models",
     "optical_flow",
     "stag_detector",

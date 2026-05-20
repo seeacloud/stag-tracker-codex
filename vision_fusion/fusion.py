@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from typing import Optional
+
 import numpy as np
 
+from .kalman_predictor import KalmanPredictor
 from .models import (
     BBox,
     Detection,
@@ -18,14 +21,18 @@ from .optical_flow import OpticalFlowTracker
 class FusionTracker:
     def __init__(
         self,
-        flow: OpticalFlowTracker,
+        flow: Optional[OpticalFlowTracker] = None,
+        kalman: Optional[KalmanPredictor] = None,
+        predictor: str = "flow",
         iou_threshold: float = 0.25,
         max_missed: int = 20,
         smooth_alpha: float = 0.35,
         smooth_deadband: float = 1.5,
         smooth_snap: float = 70.0,
     ) -> None:
+        self.predictor_mode = predictor
         self.flow = flow
+        self.kalman = kalman or (KalmanPredictor() if predictor == "kalman" else None)
         self.iou_threshold = iou_threshold
         self.max_missed = max_missed
         self.smooth_alpha = float(np.clip(smooth_alpha, 0.0, 1.0))
@@ -34,11 +41,19 @@ class FusionTracker:
         self.tracks: list[Track] = []
         self._next_track_id = 1
 
-    def predict(self, previous_gray: np.ndarray, gray: np.ndarray) -> list[Track]:
-        self.tracks = [
-            self.flow.update_track(previous_gray, gray, track)
-            for track in self.tracks
-        ]
+    def predict(
+        self,
+        previous_gray: Optional[np.ndarray] = None,
+        gray: Optional[np.ndarray] = None,
+    ) -> list[Track]:
+        if self.predictor_mode == "kalman" and self.kalman is not None:
+            for track in self.tracks:
+                self.kalman.predict_track(track)
+        elif self.flow is not None and previous_gray is not None and gray is not None:
+            self.tracks = [
+                self.flow.update_track(previous_gray, gray, track)
+                for track in self.tracks
+            ]
         for track in self.tracks:
             self._stabilize_track(track)
         self._merge_duplicate_marker_tracks()
@@ -200,7 +215,12 @@ class FusionTracker:
 
     def _new_track(self, gray: np.ndarray, measurement: dict[str, object]) -> Track:
         bbox = measurement["bbox"]
-        points = self.flow.seed_points(gray, bbox)  # type: ignore[arg-type]
+        if self.predictor_mode == "kalman":
+            points = np.empty((0, 1, 2), dtype=np.float32)
+        elif self.flow is not None:
+            points = self.flow.seed_points(gray, bbox)  # type: ignore[arg-type]
+        else:
+            points = np.empty((0, 1, 2), dtype=np.float32)
         track = Track(
             track_id=self._next_track_id,
             bbox=bbox,  # type: ignore[arg-type]
@@ -215,6 +235,8 @@ class FusionTracker:
         self._stabilize_track(track, reset=True)
         append_track_history(track)
         self._next_track_id += 1
+        if self.predictor_mode == "kalman" and self.kalman is not None:
+            self.kalman.init_track(track)
         return track
 
     def _apply_measurement(
@@ -236,16 +258,21 @@ class FusionTracker:
         track.missed = 0
         track.detection_missed = 0
         track.source = str(measurement["source"])
-        self.flow.refresh_points(gray, track)
+        if self.predictor_mode == "kalman" and self.kalman is not None:
+            self.kalman.correct_track(track)
+        elif self.flow is not None:
+            self.flow.refresh_points(gray, track)
         self._stabilize_track(track)
         append_track_history(track)
 
     def _drop_stale(self) -> None:
-        self.tracks = [
-            track
-            for track in self.tracks
-            if max(track.missed, track.detection_missed) <= self.max_missed
-        ]
+        kept: list[Track] = []
+        for track in self.tracks:
+            if max(track.missed, track.detection_missed) <= self.max_missed:
+                kept.append(track)
+            elif self.predictor_mode == "kalman" and self.kalman is not None:
+                self.kalman.remove_track(track.track_id)
+        self.tracks = kept
 
     def _record_unmatched_history(self, matched_track_ids: set[int]) -> None:
         for track in self.tracks:

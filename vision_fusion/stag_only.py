@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import threading
 import time
 from collections import deque
 from dataclasses import replace
@@ -12,10 +13,12 @@ import cv2
 import numpy as np
 
 from .fusion import FusionTracker
+from .kalman_predictor import KalmanPredictor
 from .models import BBox, StagCandidate, StagObservation, Track, clip_bbox
 from .optical_flow import OpticalFlowTracker
 from .preprocess import EnhanceConfig
 from .async_detector import AsyncDetector
+from .process_camera import ProcessCamera
 from .screen_mapper import ScreenMapper, draw_screen_observations, draw_screen_tracks
 from .stag_detector import CameraCalibration, PassConfig, StagDetector
 from .tuio_sender import TuioSender, tracks_to_tuio_objects
@@ -45,6 +48,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tuio-port", type=int, default=3333, help="TUIO UDP target port.")
     parser.add_argument("--tuio-source", default="vision_fusion", help="TUIO source name.")
     parser.add_argument("--no-memory", action="store_true", help="Disable optical-flow memory tracking.")
+    parser.add_argument(
+        "--predictor",
+        choices=("kalman", "flow"),
+        default="kalman",
+        help="Prediction method between detections. 'kalman' is lightweight (<1ms), 'flow' uses optical flow (~40ms). Default kalman.",
+    )
     parser.add_argument("--detect-interval", type=int, default=1, help="Submit detection every N frames. Default 1 = every frame (async pipeline handles throughput).")
     parser.add_argument("--reacquire-interval", type=int, default=30, help="Run a full-frame search every N frames.")
     parser.add_argument("--fallback-full-interval", type=int, default=5, help="Add a full-screen/screen-map ROI every N frames while tracking.")
@@ -63,13 +72,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-frames", type=int, default=0, help="Stop after N frames. 0 runs until the source ends.")
     parser.add_argument("--camera-width", type=int, default=1280, help="Requested camera capture width (default 1280 = 720p).")
     parser.add_argument("--camera-height", type=int, default=720, help="Requested camera capture height (default 720 = 720p).")
-    parser.add_argument("--camera-fps", type=float, default=None, help="Requested camera capture FPS.")
+    parser.add_argument("--camera-fps", type=float, default=60, help="Requested camera capture FPS. Default 60.")
     parser.add_argument("--camera-fourcc", default="MJPG", help="Requested camera FOURCC. Default MJPG enables 720p@30 on most USB webcams.")
     parser.add_argument(
         "--camera-backend",
         choices=("any", "dshow", "msmf"),
-        default="dshow",
-        help="OpenCV camera backend on Windows. Default 'dshow' is required for stable MJPG 720p on this project's USB cam.",
+        default="msmf",
+        help="OpenCV camera backend on Windows. Default 'msmf' achieves 720p@60fps on this project's USB cam.",
     )
     parser.add_argument("--log-every", type=int, default=120, help="Print average FPS every N frames. 0 disables logs.")
     parser.add_argument("--log-jsonl", default=None, help="Append per-frame JSON lines with detection state to this file.")
@@ -99,6 +108,12 @@ def parse_args() -> argparse.Namespace:
         help="DSHOW exposure value, log2 seconds (e.g. -7 for ~1/128s). Lower = shorter exposure = less motion blur.",
     )
     parser.add_argument(
+        "--gamma",
+        type=float,
+        default=0.6,
+        help="Gamma correction applied before detection. <1 brightens (compensates dark frames). Default 0.6 is empirically optimal for MSMF 720p.",
+    )
+    parser.add_argument(
         "--scales",
         default="0.75,1.0,1.5",
         help="Comma-separated detection scales for the 1-pass fallback path, e.g. '0.75,1.0,1.5'. Default is the verified best-1-pass triplet. Ignored when --detect-passes is non-empty.",
@@ -117,14 +132,17 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--detect-passes",
-        default="3.5:0.75,1.0,1.5:140:off;4.5:0.6,1.0,2.0:100:on",
+        default="3.5:0.75,1.0,1.5:140:off;4.5:0.6,1.0,2.0:100:on;4.0:0.5,1.0,2.0:80:4.0,2.5",
         help=(
             "Multi-pass detection spec, semicolon-separated. Each pass is "
             "'clahe_clip:scales:roi_min_short_side[:sharpen]'. "
-            "Default is the project's best 2-pass config (baseline + aggressive). "
+            "Default is a 3-pass config: baseline + aggressive + deblur. "
+            "The 3rd pass uses strong sharpening (amount=4.0, radius=2.5) to "
+            "recover out-of-focus markers. "
             "Use 'off' for clahe_clip to disable CLAHE in that pass. "
             "Optional 4th field controls sharpen per pass: 'off' disables, "
-            "'on' enables (using --sharpen-amount), or a number sets the amount. "
+            "'on' enables (using --sharpen-amount), a number sets the amount, "
+            "or 'amount,radius' sets both. "
             "Pass empty string ('') to fall back to the legacy single-pass path "
             "using --enhance-clahe / --scales / --roi-min-short-side."
         ),
@@ -132,8 +150,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--pass-workers",
         type=int,
-        default=6,
-        help="Process pool size for parallel detection. Default 6 matches 2-pass × 3-scale.",
+        default=9,
+        help="Process pool size for parallel detection. Default 9 matches 3-pass x 3-scale.",
     )
     parser.add_argument(
         "--expected-ids",
@@ -235,11 +253,22 @@ def parse_passes(spec: str, base_enhance: EnhanceConfig) -> list[PassConfig]:
 
         sharpen_on = base_enhance.sharpen
         sharpen_amount = base_enhance.sharpen_amount
+        sharpen_radius = base_enhance.sharpen_radius
         if sharpen_token is not None:
             t = sharpen_token.lower()
             if t == "off":
                 sharpen_on = False
             elif t == "on":
+                sharpen_on = True
+            elif "," in sharpen_token:
+                parts_s = sharpen_token.split(",")
+                try:
+                    sharpen_amount = float(parts_s[0])
+                    sharpen_radius = float(parts_s[1])
+                except (ValueError, IndexError) as exc:
+                    raise SystemExit(
+                        f"--detect-passes sharpen must be 'on'/'off', a number, or 'amount,radius', got {sharpen_token!r}"
+                    ) from exc
                 sharpen_on = True
             else:
                 try:
@@ -258,6 +287,7 @@ def parse_passes(spec: str, base_enhance: EnhanceConfig) -> list[PassConfig]:
                     clahe_clip=clahe_clip,
                     sharpen=sharpen_on,
                     sharpen_amount=sharpen_amount,
+                    sharpen_radius=sharpen_radius,
                 ),
                 scales=parse_scales(scales_token),
                 roi_min_short_side=max(0, roi_min),
@@ -266,6 +296,44 @@ def parse_passes(spec: str, base_enhance: EnhanceConfig) -> list[PassConfig]:
     if not passes:
         raise SystemExit("--detect-passes parsed to zero passes")
     return passes
+
+
+class ThreadedCamera:
+    """Non-blocking camera reader. Grabs frames in a background thread."""
+
+    def __init__(self, capture: cv2.VideoCapture) -> None:
+        self._cap = capture
+        self._frame: Optional[np.ndarray] = None
+        self._new_frame = False
+        self._lock = threading.Lock()
+        self._running = True
+        self._thread = threading.Thread(target=self._reader, daemon=True)
+        self._thread.start()
+
+    def _reader(self) -> None:
+        while self._running:
+            ok, frame = self._cap.read()
+            if not ok:
+                with self._lock:
+                    self._running = False
+                return
+            with self._lock:
+                self._frame = frame
+                self._new_frame = True
+
+    def read(self) -> tuple[bool, Optional[np.ndarray], bool]:
+        """Returns (ok, frame, is_new). frame is always the latest; is_new indicates fresh."""
+        with self._lock:
+            if not self._running and self._frame is None:
+                return False, None, False
+            is_new = self._new_frame
+            self._new_frame = False
+            return True, self._frame, is_new
+
+    def release(self) -> None:
+        self._running = False
+        self._thread.join(timeout=2.0)
+        self._cap.release()
 
 
 def main() -> int:
@@ -311,6 +379,7 @@ def main() -> int:
     )
     calibration = load_calibration(args.calibration)
     base_enhance = EnhanceConfig(
+        gamma=args.gamma,
         clahe=args.enhance_clahe,
         clahe_clip=args.clahe_clip,
         clahe_grid=args.clahe_grid,
@@ -339,13 +408,20 @@ def main() -> int:
         passes=detect_passes or detector.passes,
         workers=args.pass_workers,
     )
-    flow = OpticalFlowTracker(
-        max_corners=args.flow_points,
-        min_points=args.flow_min_points,
-        use_affine=True,
-    )
+    if args.predictor == "kalman":
+        kalman = KalmanPredictor()
+        flow = None
+    else:
+        kalman = None
+        flow = OpticalFlowTracker(
+            max_corners=args.flow_points,
+            min_points=args.flow_min_points,
+            use_affine=True,
+        )
     fusion = FusionTracker(
         flow=flow,
+        kalman=kalman,
+        predictor=args.predictor,
         max_missed=args.max_missed,
         smooth_alpha=args.smooth_alpha,
         smooth_deadband=args.smooth_deadband,
@@ -369,17 +445,44 @@ def main() -> int:
     profile_count = 0
     profile_interval = args.log_every or 120
 
+    use_threaded = False
+    proc_cam: Optional[ProcessCamera] = None
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    annotated = frame.copy()
+    screen_view = None
+    active_count = 0
+    cam_frame_count = 0
+    cam_fps_start = time.perf_counter()
+    cam_fps: float = 0.0
+
     try:
-        while ok:
+        while True:
             t0 = time.perf_counter()
+            got_new_frame = True
+
+            ok, frame = capture.read()
+            if not ok:
+                break
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             t1 = time.perf_counter()
 
+            if got_new_frame:
+                cam_frame_count += 1
+            cam_elapsed = t1 - cam_fps_start
+            if cam_elapsed >= 0.5:
+                cam_fps = cam_frame_count / cam_elapsed
+                cam_frame_count = 0
+                cam_fps_start = t1
+
             predicted = False
             updated = False
-            if not args.no_memory and previous_gray is not None and fusion.tracks:
-                fusion.predict(previous_gray, gray)
-                predicted = True
+            if not args.no_memory and fusion.tracks:
+                if args.predictor == "kalman":
+                    fusion.predict()
+                    predicted = True
+                elif previous_gray is not None:
+                    fusion.predict(previous_gray, gray)
+                    predicted = True
             t2 = time.perf_counter()
 
             observations = []
@@ -393,7 +496,7 @@ def main() -> int:
                     updated = True
 
             # Then submit next frame for detection (non-blocking)
-            should_detect = frame_index % max(1, args.detect_interval) == 0
+            should_detect = got_new_frame and frame_index % max(1, args.detect_interval) == 0
             if should_detect:
                 rois = detection_rois(frame, fusion.tracks, args, frame_index, screen_mapper)
                 async_det.submit(frame, rois)
@@ -408,68 +511,72 @@ def main() -> int:
             last_time = now
             fps_window.append(fps)
 
-            display_frame = maybe_mirror(frame, args.mirror)
-            display_tracks = (
-                mirror_tracks_for_display(fusion.tracks, frame.shape[1])
-                if args.mirror
-                else fusion.tracks
-            )
-            display_observations = (
-                mirror_observations_for_display(observations, frame.shape[1])
-                if args.mirror
-                else observations
-            )
-            display_candidates = (
-                mirror_candidates_for_display(detector.last_candidates, frame.shape[1])
-                if args.mirror
-                else detector.last_candidates
-            )
+            need_redraw = True
+            if need_redraw:
+                display_frame = maybe_mirror(frame, args.mirror)
+                display_tracks = (
+                    mirror_tracks_for_display(fusion.tracks, frame.shape[1])
+                    if args.mirror
+                    else fusion.tracks
+                )
+                display_observations = (
+                    mirror_observations_for_display(observations, frame.shape[1])
+                    if args.mirror
+                    else observations
+                )
+                display_candidates = (
+                    mirror_candidates_for_display(detector.last_candidates, frame.shape[1])
+                    if args.mirror
+                    else detector.last_candidates
+                )
 
-            annotated = display_frame.copy()
-            if screen_mapper is not None:
-                screen_mapper.draw_source_outline(annotated)
-            if args.show_candidates:
-                draw_candidates(annotated, display_candidates)
-            if args.no_memory:
-                draw_observations(annotated, display_observations)
-                active_count = len(display_observations)
-            else:
-                draw_tracks(annotated, display_tracks, visual_hold=args.visual_hold)
-                active_count = len(display_tracks)
-            draw_status(
-                annotated,
-                frame_index,
-                fps,
-                active_count,
-                not args.no_memory,
-                fusion.smooth_alpha,
-                fusion.smooth_deadband,
-            )
-
-            if writer is not None:
-                writer.write(annotated)
-            if raw_writer is not None:
-                raw_writer.write(frame)
-
-            screen_view = None
-            if screen_mapper is not None:
-                screen_input = display_frame if args.mirror else frame
-                screen_view = screen_mapper.warp(screen_input)
+                annotated = display_frame.copy()
+                if screen_mapper is not None:
+                    screen_mapper.draw_source_outline(annotated)
+                if args.show_candidates:
+                    draw_candidates(annotated, display_candidates)
                 if args.no_memory:
-                    draw_screen_observations(screen_view, display_observations, screen_mapper)
+                    draw_observations(annotated, display_observations)
+                    active_count = len(display_observations)
                 else:
-                    draw_screen_tracks(
-                        screen_view,
-                        display_tracks,
-                        screen_mapper,
-                        visual_hold=args.visual_hold,
-                    )
-                draw_screen_status(screen_view, fps, active_count)
-                if screen_writer is not None:
-                    screen_writer.write(screen_view)
+                    draw_tracks(annotated, display_tracks, visual_hold=args.visual_hold)
+                    active_count = len(display_tracks)
+                draw_status(
+                    annotated,
+                    frame_index,
+                    fps,
+                    active_count,
+                    not args.no_memory,
+                    fusion.smooth_alpha,
+                    fusion.smooth_deadband,
+                    cam_fps=cam_fps,
+                )
+
+            if need_redraw:
+                if writer is not None:
+                    writer.write(annotated)
+                if raw_writer is not None:
+                    raw_writer.write(frame)
+
+                screen_view = None
+                if screen_mapper is not None:
+                    screen_input = display_frame if args.mirror else frame
+                    screen_view = screen_mapper.warp(screen_input)
+                    if args.no_memory:
+                        draw_screen_observations(screen_view, display_observations, screen_mapper)
+                    else:
+                        draw_screen_tracks(
+                            screen_view,
+                            display_tracks,
+                            screen_mapper,
+                            visual_hold=args.visual_hold,
+                        )
+                    draw_screen_status(screen_view, fps, active_count)
+                    if screen_writer is not None:
+                        screen_writer.write(screen_view)
             t5 = time.perf_counter()
 
-            if tuio_sender is not None:
+            if need_redraw and tuio_sender is not None:
                 tuio_sender.send(
                     tracks_to_tuio_objects(
                         fusion.tracks,
@@ -478,10 +585,11 @@ def main() -> int:
                     )
                 )
 
-            if args.show:
+            if args.show and need_redraw:
                 cv2.imshow("STag only", annotated)
                 if screen_view is not None and not args.no_screen_view:
                     cv2.imshow("Screen view", screen_view)
+            if args.show:
                 key = cv2.waitKeyEx(1)
                 if handle_key(key, fusion, args.smooth_step):
                     break
@@ -495,7 +603,6 @@ def main() -> int:
             profile_accum["display"] += t6 - t5
             profile_count += 1
 
-            ok, frame = capture.read()
             previous_gray = gray
             frame_index += 1
             if profile_interval and frame_index % profile_interval == 0 and fps_window:
@@ -507,7 +614,7 @@ def main() -> int:
                 total_ms = sum(avg.values())
                 print(
                     f"frame={frame_index} fps_wall={wall_fps:.1f} "
-                    f"fps_loop={loop_fps:.1f} active={active_count} "
+                    f"fps_loop={loop_fps:.1f} cam_fps={cam_fps:.1f} active={active_count} "
                     f"observed={len(observations)}"
                 )
                 print(
@@ -586,8 +693,11 @@ def configure_camera(capture: cv2.VideoCapture, args: argparse.Namespace) -> Non
     if args.camera_fps:
         capture.set(cv2.CAP_PROP_FPS, args.camera_fps)
     if args.camera_exposure is not None:
-        capture.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
+        capture.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)
         capture.set(cv2.CAP_PROP_EXPOSURE, args.camera_exposure)
+    elif args.camera_backend == "msmf":
+        capture.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)
+        capture.set(cv2.CAP_PROP_EXPOSURE, -4)
     capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
 
@@ -745,15 +855,18 @@ def draw_status(
     memory_enabled: bool,
     smooth_alpha: float,
     smooth_deadband: float,
+    cam_fps: float = 0.0,
 ) -> None:
     mode = "STag memory" if memory_enabled else "STag only"
     label = "tracks" if memory_enabled else "markers"
+    cam_str = f" | cam {cam_fps:.1f}" if cam_fps > 0 else ""
     text = (
-        f"{mode} | frame {frame_index} | fps {fps:.1f} | {label} {active_count} "
+        f"{mode} | frame {frame_index} | fps {fps:.1f}{cam_str} | {label} {active_count} "
         f"| alpha {smooth_alpha:.2f} dead {smooth_deadband:.1f}"
     )
     font = cv2.FONT_HERSHEY_SIMPLEX
-    cv2.rectangle(frame, (8, 8), (640, 34), (40, 40, 40), -1)
+    text_width = cv2.getTextSize(text, font, 0.5, 1)[0][0]
+    cv2.rectangle(frame, (8, 8), (text_width + 22, 34), (40, 40, 40), -1)
     cv2.putText(frame, text, (14, 27), font, 0.5, (245, 245, 245), 1, cv2.LINE_AA)
 
 

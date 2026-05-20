@@ -1,4 +1,4 @@
-"""STag tracker — 720p USB camera, double-click to run (.pyw)."""
+"""STag tracker — 720p USB camera @ 60fps, double-click to run (.pyw)."""
 import multiprocessing
 import sys
 
@@ -14,7 +14,12 @@ if __name__ == "__main__":
         "--camera-width", "1280",
         "--camera-height", "720",
         "--camera-fourcc", "MJPG",
-        "--camera-backend", "dshow",
+        "--camera-backend", "msmf",
+        "--camera-fps", "60",
+        "--camera-exposure", "-4",
+        "--predictor", "kalman",
+        "--gamma", "0.6",
+        "--pass-workers", "9",
     ]
 
     raise SystemExit(main())
