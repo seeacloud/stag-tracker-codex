@@ -173,6 +173,17 @@ def parse_args() -> argparse.Namespace:
         default=0.7,
         help="Minimum confidence for CNN classifier predictions. Default 0.7.",
     )
+    parser.add_argument(
+        "--yolo-model",
+        default=None,
+        help="Path to trained YOLO marker locator model (.pt). Finds markers that STag's quad detection misses.",
+    )
+    parser.add_argument(
+        "--yolo-confidence",
+        type=float,
+        default=0.4,
+        help="YOLO detection confidence threshold. Default 0.4.",
+    )
     return parser.parse_args()
 
 
@@ -496,6 +507,14 @@ def main() -> int:
         )
         print(f"CNN classifier loaded: {args.classifier_model}")
     recovery = CandidateRecovery(library_hd=args.stag_library, classifier=classifier)
+    yolo_locator = None
+    if args.yolo_model:
+        from .yolo_locator import YoloLocator
+        yolo_locator = YoloLocator(
+            model_path=args.yolo_model,
+            confidence=args.yolo_confidence,
+        )
+        print(f"YOLO locator loaded: {args.yolo_model}")
 
     frame_index = 0
     start_time = time.perf_counter()
@@ -562,45 +581,8 @@ def main() -> int:
                 # Learn templates from successful detections
                 for obs in observations:
                     recovery.learn_template(obs.marker_id, frame, obs.corners)
-                # Try to recover unrecognized candidates
-                # Skip candidates that overlap with already-confirmed detections/tracks
-                # CNN classifier is fast (<1ms batch), run every frame when available;
-                # fall back to throttled re-detect/template if no classifier
-                should_recover = new_candidates and (
-                    classifier is not None or frame_index % 30 < 2
-                )
-                if should_recover:
-                    from .models import bbox_from_points as _bfp
-                    candidates_to_recover = [
-                        c for c in new_candidates
-                        if not _overlaps_existing(_bfp(c.corners), observations, fusion.tracks)
-                    ]
-                    recovered = recovery.try_recover(
-                        frame, [c.corners for c in candidates_to_recover]
-                    )
-                    for marker_id, corners, confidence in recovered:
-                        from .models import bbox_from_points
-                        stable_corners = _stabilize_recovered_corners(
-                            marker_id, corners, fusion.tracks, alpha=0.3
-                        )
-                        bbox = bbox_from_points(stable_corners)
-                        # Iron rule: markers never overlap. Reject if overlapping
-                        # with any existing observation or tracked marker.
-                        if _overlaps_existing(bbox, observations, fusion.tracks):
-                            continue
-                        obs = StagObservation(
-                            marker_id=marker_id,
-                            corners=stable_corners,
-                            bbox=bbox,
-                            pose=None,
-                        )
-                        observations.append(obs)
-                    if recovered:
-                        new_candidates = [
-                            c for c in new_candidates
-                            if not any(np.allclose(c.corners, r[1]) for r in recovered)
-                        ]
-                # Filter out candidates inside already-confirmed markers (no point showing them)
+
+                # Filter out candidates inside already-confirmed markers
                 if new_candidates:
                     from .models import bbox_from_points as _bfp2
                     new_candidates = [
@@ -608,6 +590,66 @@ def main() -> int:
                         if not _overlaps_existing(_bfp2(c.corners), observations, fusion.tracks)
                     ]
                 detector.last_candidates = new_candidates
+
+            # YOLO locator: find ALL markers (including blurry ones STag missed)
+            # Then try STag decode on each region; if fail → CNN classify
+            if yolo_locator is not None and async_result is not None:
+                existing_bboxes = [obs.bbox for obs in observations]
+                existing_bboxes += [t.bbox for t in fusion.tracks]
+                yolo_regions = yolo_locator.locate(frame, existing_bboxes)
+
+                for corners, bbox in yolo_regions:
+                    # Step 1: try STag decode on this region
+                    import stag as _stag
+                    x, y, w, h = bbox
+                    pad = 10
+                    rx1 = max(0, x - pad)
+                    ry1 = max(0, y - pad)
+                    rx2 = min(gray.shape[1], x + w + pad)
+                    ry2 = min(gray.shape[0], y + h + pad)
+                    roi_gray = gray[ry1:ry2, rx1:rx2]
+
+                    stag_id = None
+                    if roi_gray.size > 0:
+                        try:
+                            s_corners, s_ids, _ = _stag.detectMarkers(roi_gray, args.stag_library)
+                        except TypeError:
+                            s_corners, s_ids, _ = _stag.detectMarkers(roi_gray, libraryHD=args.stag_library)
+                        if s_ids is not None and len(s_ids) > 0:
+                            stag_id = int(s_ids[0][0]) if hasattr(s_ids[0], '__len__') else int(s_ids[0])
+                            # Offset corners back to full frame coords
+                            det_corners = s_corners[0].reshape(4, 2) + np.array([rx1, ry1], dtype=np.float32)
+                            corners = det_corners
+
+                    if stag_id is not None:
+                        from .models import bbox_from_points
+                        obs = StagObservation(
+                            marker_id=stag_id,
+                            corners=corners,
+                            bbox=bbox_from_points(corners),
+                            pose=None,
+                        )
+                        observations.append(obs)
+                    elif classifier is not None:
+                        # Step 2: CNN classify
+                        src_pts = corners.reshape(4, 2).astype(np.float32)
+                        dst_pts = np.array([
+                            [0, 0], [128, 0], [128, 128], [0, 128]
+                        ], dtype=np.float32)
+                        M = cv2.getPerspectiveTransform(src_pts, dst_pts)
+                        patch = cv2.warpPerspective(gray, M, (128, 128))
+                        predictions = classifier.classify([patch])
+                        if predictions and predictions[0][0] is not None:
+                            marker_id, conf = predictions[0]
+                            obs = StagObservation(
+                                marker_id=marker_id,
+                                corners=corners,
+                                bbox=bbox,
+                                pose=None,
+                            )
+                            observations.append(obs)
+
+            if async_result is not None:
                 if not args.no_memory:
                     fusion.update(gray, [], observations)
                     updated = True

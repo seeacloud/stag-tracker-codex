@@ -21,6 +21,7 @@ if __name__ == "__main__":
         "--gamma", "0.6",
         "--pass-workers", "12",
         "--classifier-model", "models/stag_hd17.pt",
+        "--yolo-model", "models/yolo_marker.pt",
     ]
 
     raise SystemExit(main())
