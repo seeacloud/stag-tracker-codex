@@ -15,6 +15,7 @@ from .models import (
     bbox_center,
     bbox_iou,
 )
+from .one_euro_filter import OneEuroFilter2D
 from .optical_flow import OpticalFlowTracker
 
 
@@ -29,6 +30,10 @@ class FusionTracker:
         smooth_alpha: float = 0.35,
         smooth_deadband: float = 6.0,
         smooth_snap: float = 70.0,
+        oef_min_cutoff: float = 1.0,
+        oef_beta: float = 0.007,
+        oef_dcutoff: float = 1.0,
+        oef_fps: float = 60.0,
     ) -> None:
         self.predictor_mode = predictor
         self.flow = flow
@@ -38,6 +43,13 @@ class FusionTracker:
         self.smooth_alpha = float(np.clip(smooth_alpha, 0.0, 1.0))
         self.smooth_deadband = smooth_deadband
         self.smooth_snap = smooth_snap
+        # 1-Euro Filter parameters (per-track filters stored in _oef_filters)
+        self._oef_min_cutoff = oef_min_cutoff
+        self._oef_beta = oef_beta
+        self._oef_dcutoff = oef_dcutoff
+        self._oef_fps = oef_fps
+        # Per-track filter state: track_id -> {"bbox": OneEuroFilter2D, "corners": OneEuroFilter2D}
+        self._oef_filters: dict[int, dict[str, OneEuroFilter2D]] = {}
         self.tracks: list[Track] = []
         self._next_track_id = 1
 
@@ -270,8 +282,11 @@ class FusionTracker:
         for track in self.tracks:
             if max(track.missed, track.detection_missed) <= self.max_missed:
                 kept.append(track)
-            elif self.predictor_mode == "kalman" and self.kalman is not None:
-                self.kalman.remove_track(track.track_id)
+            else:
+                # Clean up filter state for dropped tracks
+                self._oef_filters.pop(track.track_id, None)
+                if self.predictor_mode == "kalman" and self.kalman is not None:
+                    self.kalman.remove_track(track.track_id)
         self.tracks = kept
 
     def _record_unmatched_history(self, matched_track_ids: set[int]) -> None:
@@ -293,10 +308,16 @@ class FusionTracker:
             if current is None or self._track_rank(track) > self._track_rank(current):
                 best_by_marker[track.marker_id] = track
 
-        self.tracks = markerless + sorted(
+        new_tracks = markerless + sorted(
             best_by_marker.values(),
             key=lambda track: track.track_id,
         )
+        # Clean up filter state for merged-away tracks
+        kept_ids = {t.track_id for t in new_tracks}
+        for tid in list(self._oef_filters.keys()):
+            if tid not in kept_ids:
+                del self._oef_filters[tid]
+        self.tracks = new_tracks
 
     @staticmethod
     def _track_rank(track: Track) -> tuple[int, int, int, int, int]:
@@ -309,27 +330,46 @@ class FusionTracker:
         )
 
     def _stabilize_track(self, track: Track, reset: bool = False) -> None:
-        track.display_bbox = self._smooth_bbox(track.display_bbox, track.bbox, reset)
+        track.display_bbox = self._smooth_bbox(track.track_id, track.display_bbox, track.bbox, reset)
         if track.corners is None:
             track.display_corners = None
         else:
             track.display_corners = self._smooth_points(
+                track.track_id,
                 track.display_corners,
                 track.corners,
                 reset,
             )
 
+    def _get_oef(self, track_id: int, key: str) -> OneEuroFilter2D:
+        """Get or create a 1-Euro Filter for a specific track and signal."""
+        filters = self._oef_filters.get(track_id)
+        if filters is None:
+            filters = {}
+            self._oef_filters[track_id] = filters
+        filt = filters.get(key)
+        if filt is None:
+            filt = OneEuroFilter2D(
+                min_cutoff=self._oef_min_cutoff,
+                beta=self._oef_beta,
+                dcutoff=self._oef_dcutoff,
+                fps=self._oef_fps,
+            )
+            filters[key] = filt
+        return filt
+
     def _smooth_bbox(
         self,
+        track_id: int,
         previous: tuple[float, float, float, float] | None,
         current: BBox,
         reset: bool,
     ) -> tuple[float, float, float, float]:
         target = np.asarray(current, dtype=np.float32)
-        if reset or previous is None or self.smooth_alpha >= 1.0:
+        if reset or previous is None:
+            filt = self._get_oef(track_id, "bbox")
+            filt.reset(target.reshape(1, 4))
             return tuple(float(v) for v in target)
-        if self.smooth_alpha <= 0.0:
-            return previous
 
         prev = np.asarray(previous, dtype=np.float32)
         center_delta = np.linalg.norm(
@@ -342,41 +382,38 @@ class FusionTracker:
                 dtype=np.float32,
             )
         )
-        if center_delta <= self.smooth_deadband and np.max(np.abs(target[2:] - prev[2:])) <= self.smooth_deadband:
-            return previous
+        # Snap threshold: teleport bypasses filter
         if center_delta >= self.smooth_snap:
+            filt = self._get_oef(track_id, "bbox")
+            filt.reset(target.reshape(1, 4))
             return tuple(float(v) for v in target)
 
-        # Adaptive alpha: smaller movement → lower alpha (more stable when near-stationary)
-        motion_ratio = min(center_delta / self.smooth_snap, 1.0)
-        alpha = self.smooth_alpha * motion_ratio
-        alpha = max(alpha, 0.05)  # floor to avoid complete freeze
-
-        smoothed = prev + alpha * (target - prev)
-        return tuple(float(v) for v in smoothed)
+        # Apply 1-Euro Filter
+        filt = self._get_oef(track_id, "bbox")
+        smoothed = filt(target.reshape(1, 4))
+        return tuple(float(v) for v in smoothed.flat)
 
     def _smooth_points(
         self,
+        track_id: int,
         previous: np.ndarray | None,
         current: np.ndarray,
         reset: bool,
     ) -> np.ndarray:
         target = np.asarray(current, dtype=np.float32)
-        if reset or previous is None or previous.shape != target.shape or self.smooth_alpha >= 1.0:
+        if reset or previous is None or previous.shape != target.shape:
+            filt = self._get_oef(track_id, "corners")
+            filt.reset(target)
             return target.copy()
-        if self.smooth_alpha <= 0.0:
-            return previous
 
+        # Check for teleport (snap threshold)
         deltas = np.linalg.norm(target.reshape(-1, 2) - previous.reshape(-1, 2), axis=1)
         mean_delta = float(np.mean(deltas))
-        if mean_delta <= self.smooth_deadband:
-            return previous
         if mean_delta >= self.smooth_snap:
+            filt = self._get_oef(track_id, "corners")
+            filt.reset(target)
             return target.copy()
 
-        # Adaptive alpha: smaller movement → lower alpha
-        motion_ratio = min(mean_delta / self.smooth_snap, 1.0)
-        alpha = self.smooth_alpha * motion_ratio
-        alpha = max(alpha, 0.05)
-
-        return previous + alpha * (target - previous)
+        # Apply 1-Euro Filter
+        filt = self._get_oef(track_id, "corners")
+        return filt(target)

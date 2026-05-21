@@ -17,6 +17,7 @@ if __name__ == "__main__":
         "--camera-backend", "msmf",
         "--camera-fps", "60",
         "--camera-exposure", "-4",
+        "--no-mirror",
         "--predictor", "kalman",
         "--gamma", "0.6",
         "--pass-workers", "12",

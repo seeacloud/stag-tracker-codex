@@ -8,6 +8,7 @@ __all__ = [
     "models",
     "optical_flow",
     "stag_detector",
+    "temporal_voter",
     "visualization",
     "yolo_detector",
 ]

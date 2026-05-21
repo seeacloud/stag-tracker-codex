@@ -15,6 +15,7 @@ import numpy as np
 from .fusion import FusionTracker
 from .kalman_predictor import KalmanPredictor
 from .candidate_recovery import CandidateRecovery
+from .temporal_voter import TemporalVoter
 from .models import BBox, StagCandidate, StagObservation, Track, clip_bbox
 from .optical_flow import OpticalFlowTracker
 from .preprocess import EnhanceConfig
@@ -507,6 +508,7 @@ def main() -> int:
         )
         print(f"CNN classifier loaded: {args.classifier_model}")
     recovery = CandidateRecovery(library_hd=args.stag_library, classifier=classifier)
+    temporal_voter = TemporalVoter(window=8, min_votes=3, max_drift_px=20.0)
     yolo_locator = None
     if args.yolo_model:
         from .yolo_locator import YoloLocator
@@ -589,11 +591,36 @@ def main() -> int:
                         c for c in new_candidates
                         if not _overlaps_existing(_bfp2(c.corners), observations, fusion.tracks)
                     ]
+
+                # CNN recovery on rejected candidates (STag found quad but can't decode)
+                if new_candidates and classifier is not None:
+                    from .models import bbox_from_points as _bfp3
+                    recovered = recovery.try_recover(
+                        frame, [c.corners for c in new_candidates]
+                    )
+                    for marker_id, corners, confidence in recovered:
+                        bbox = _bfp3(corners)
+                        if _overlaps_existing(bbox, observations, fusion.tracks):
+                            continue
+                        if temporal_voter.submit(marker_id, bbox, frame_index):
+                            obs = StagObservation(
+                                marker_id=marker_id,
+                                corners=corners,
+                                bbox=bbox,
+                                pose=None,
+                            )
+                            observations.append(obs)
+                    if recovered:
+                        new_candidates = [
+                            c for c in new_candidates
+                            if not any(np.allclose(c.corners, r[1]) for r in recovered)
+                        ]
+
                 detector.last_candidates = new_candidates
 
             # YOLO locator: find ALL markers (including blurry ones STag missed)
-            # Then try STag decode on each region; if fail → CNN classify
-            if yolo_locator is not None and async_result is not None:
+            # Runs every frame independently of async STag results
+            if yolo_locator is not None:
                 existing_bboxes = [obs.bbox for obs in observations]
                 existing_bboxes += [t.bbox for t in fusion.tracks]
                 yolo_regions = yolo_locator.locate(frame, existing_bboxes)
@@ -631,7 +658,7 @@ def main() -> int:
                         )
                         observations.append(obs)
                     elif classifier is not None:
-                        # Step 2: CNN classify
+                        # Step 2: CNN classify — needs temporal voting
                         src_pts = corners.reshape(4, 2).astype(np.float32)
                         dst_pts = np.array([
                             [0, 0], [128, 0], [128, 128], [0, 128]
@@ -641,15 +668,17 @@ def main() -> int:
                         predictions = classifier.classify([patch])
                         if predictions and predictions[0][0] is not None:
                             marker_id, conf = predictions[0]
-                            obs = StagObservation(
-                                marker_id=marker_id,
-                                corners=corners,
-                                bbox=bbox,
-                                pose=None,
-                            )
-                            observations.append(obs)
+                            # CNN predictions require temporal voting to suppress ghosts
+                            if temporal_voter.submit(marker_id, bbox, frame_index):
+                                obs = StagObservation(
+                                    marker_id=marker_id,
+                                    corners=corners,
+                                    bbox=bbox,
+                                    pose=None,
+                                )
+                                observations.append(obs)
 
-            if async_result is not None:
+            if async_result is not None or observations:
                 if not args.no_memory:
                     fusion.update(gray, [], observations)
                     updated = True
