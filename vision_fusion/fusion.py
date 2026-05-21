@@ -27,7 +27,7 @@ class FusionTracker:
         iou_threshold: float = 0.25,
         max_missed: int = 20,
         smooth_alpha: float = 0.35,
-        smooth_deadband: float = 1.5,
+        smooth_deadband: float = 6.0,
         smooth_snap: float = 70.0,
     ) -> None:
         self.predictor_mode = predictor
@@ -347,7 +347,12 @@ class FusionTracker:
         if center_delta >= self.smooth_snap:
             return tuple(float(v) for v in target)
 
-        smoothed = prev + self.smooth_alpha * (target - prev)
+        # Adaptive alpha: smaller movement → lower alpha (more stable when near-stationary)
+        motion_ratio = min(center_delta / self.smooth_snap, 1.0)
+        alpha = self.smooth_alpha * motion_ratio
+        alpha = max(alpha, 0.05)  # floor to avoid complete freeze
+
+        smoothed = prev + alpha * (target - prev)
         return tuple(float(v) for v in smoothed)
 
     def _smooth_points(
@@ -368,4 +373,10 @@ class FusionTracker:
             return previous
         if mean_delta >= self.smooth_snap:
             return target.copy()
-        return previous + self.smooth_alpha * (target - previous)
+
+        # Adaptive alpha: smaller movement → lower alpha
+        motion_ratio = min(mean_delta / self.smooth_snap, 1.0)
+        alpha = self.smooth_alpha * motion_ratio
+        alpha = max(alpha, 0.05)
+
+        return previous + alpha * (target - previous)

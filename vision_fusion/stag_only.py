@@ -361,6 +361,41 @@ class ThreadedCamera:
         self._cap.release()
 
 
+def _stabilize_recovered_corners(
+    marker_id: int, new_corners: np.ndarray, tracks: list, alpha: float = 0.3
+) -> np.ndarray:
+    """Blend CNN-recovered corners with existing track corners to reduce jitter."""
+    new_pts = np.asarray(new_corners, dtype=np.float32).reshape(4, 2)
+    for track in tracks:
+        if track.marker_id == marker_id and track.corners is not None:
+            old_pts = np.asarray(track.corners, dtype=np.float32).reshape(4, 2)
+            return old_pts + alpha * (new_pts - old_pts)
+    return new_pts
+
+
+def _overlaps_existing(
+    bbox: BBox, observations: list, tracks: list, iou_threshold: float = 0.05
+) -> bool:
+    """Reject if bbox overlaps or is contained within any existing detection/track."""
+    from .models import bbox_iou
+    cx = bbox[0] + bbox[2] / 2
+    cy = bbox[1] + bbox[3] / 2
+    for obs in observations:
+        if bbox_iou(bbox, obs.bbox) > iou_threshold:
+            return True
+        # Center-point containment check
+        ox, oy, ow, oh = obs.bbox
+        if ox <= cx <= ox + ow and oy <= cy <= oy + oh:
+            return True
+    for track in tracks:
+        if bbox_iou(bbox, track.bbox) > iou_threshold:
+            return True
+        tx, ty, tw, th = track.bbox
+        if tx <= cx <= tx + tw and ty <= cy <= ty + th:
+            return True
+    return False
+
+
 def main() -> int:
     args = parse_args()
 
@@ -527,17 +562,36 @@ def main() -> int:
                 # Learn templates from successful detections
                 for obs in observations:
                     recovery.learn_template(obs.marker_id, frame, obs.corners)
-                # Try to recover unrecognized candidates (throttled to avoid FPS drop)
-                if new_candidates and frame_index % 30 < 2:
+                # Try to recover unrecognized candidates
+                # Skip candidates that overlap with already-confirmed detections/tracks
+                # CNN classifier is fast (<1ms batch), run every frame when available;
+                # fall back to throttled re-detect/template if no classifier
+                should_recover = new_candidates and (
+                    classifier is not None or frame_index % 30 < 2
+                )
+                if should_recover:
+                    from .models import bbox_from_points as _bfp
+                    candidates_to_recover = [
+                        c for c in new_candidates
+                        if not _overlaps_existing(_bfp(c.corners), observations, fusion.tracks)
+                    ]
                     recovered = recovery.try_recover(
-                        frame, [c.corners for c in new_candidates]
+                        frame, [c.corners for c in candidates_to_recover]
                     )
                     for marker_id, corners, confidence in recovered:
                         from .models import bbox_from_points
+                        stable_corners = _stabilize_recovered_corners(
+                            marker_id, corners, fusion.tracks, alpha=0.3
+                        )
+                        bbox = bbox_from_points(stable_corners)
+                        # Iron rule: markers never overlap. Reject if overlapping
+                        # with any existing observation or tracked marker.
+                        if _overlaps_existing(bbox, observations, fusion.tracks):
+                            continue
                         obs = StagObservation(
                             marker_id=marker_id,
-                            corners=corners,
-                            bbox=bbox_from_points(corners),
+                            corners=stable_corners,
+                            bbox=bbox,
                             pose=None,
                         )
                         observations.append(obs)
@@ -546,6 +600,13 @@ def main() -> int:
                             c for c in new_candidates
                             if not any(np.allclose(c.corners, r[1]) for r in recovered)
                         ]
+                # Filter out candidates inside already-confirmed markers (no point showing them)
+                if new_candidates:
+                    from .models import bbox_from_points as _bfp2
+                    new_candidates = [
+                        c for c in new_candidates
+                        if not _overlaps_existing(_bfp2(c.corners), observations, fusion.tracks)
+                    ]
                 detector.last_candidates = new_candidates
                 if not args.no_memory:
                     fusion.update(gray, [], observations)

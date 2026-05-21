@@ -20,6 +20,7 @@ if __name__ == "__main__":
         "--predictor", "kalman",
         "--gamma", "0.6",
         "--pass-workers", "12",
+        "--classifier-model", "models/stag_hd17.pt",
     ]
 
     raise SystemExit(main())
