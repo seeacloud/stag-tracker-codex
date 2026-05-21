@@ -19,7 +19,7 @@ if __name__ == "__main__":
         "--camera-exposure", "-4",
         "--predictor", "kalman",
         "--gamma", "0.6",
-        "--pass-workers", "9",
+        "--pass-workers", "12",
     ]
 
     raise SystemExit(main())

@@ -14,6 +14,7 @@ import numpy as np
 
 from .fusion import FusionTracker
 from .kalman_predictor import KalmanPredictor
+from .candidate_recovery import CandidateRecovery
 from .models import BBox, StagCandidate, StagObservation, Track, clip_bbox
 from .optical_flow import OpticalFlowTracker
 from .preprocess import EnhanceConfig
@@ -132,26 +133,24 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--detect-passes",
-        default="3.5:0.75,1.0,1.5:140:off;4.5:0.6,1.0,2.0:100:on;4.0:0.5,1.0,2.0:80:4.0,2.5",
+        default="3.5:0.75,1.0,1.5:140:off;4.5:0.6,1.0,2.0:100:on;4.0:0.3,0.5,1.0:80:5.0,4.0;3.5:0.25,0.4,0.7:60:2.0,2.0:4",
         help=(
             "Multi-pass detection spec, semicolon-separated. Each pass is "
-            "'clahe_clip:scales:roi_min_short_side[:sharpen]'. "
-            "Default is a 3-pass config: baseline + aggressive + deblur. "
-            "The 3rd pass uses strong sharpening (amount=4.0, radius=2.5) to "
-            "recover out-of-focus markers. "
+            "'clahe_clip:scales:roi_min_short_side[:sharpen[:deconv]]'. "
+            "Default is a 4-pass config: baseline + aggressive + deblur + deconv. "
+            "Pass 3 uses strong sharpening (5.0, radius 4.0) for moderate blur. "
+            "Pass 4 uses Wiener deconvolution (disc radius 4) for severe defocus. "
             "Use 'off' for clahe_clip to disable CLAHE in that pass. "
-            "Optional 4th field controls sharpen per pass: 'off' disables, "
-            "'on' enables (using --sharpen-amount), a number sets the amount, "
-            "or 'amount,radius' sets both. "
-            "Pass empty string ('') to fall back to the legacy single-pass path "
-            "using --enhance-clahe / --scales / --roi-min-short-side."
+            "Sharpen field: 'off', 'on', a number, or 'amount,radius'. "
+            "Deconv field: integer disc radius for Wiener deconvolution (0=off). "
+            "Pass empty string ('') to fall back to the legacy single-pass path."
         ),
     )
     parser.add_argument(
         "--pass-workers",
         type=int,
-        default=9,
-        help="Process pool size for parallel detection. Default 9 matches 3-pass x 3-scale.",
+        default=12,
+        help="Process pool size for parallel detection. Default 12 matches 4-pass x 3-scale.",
     )
     parser.add_argument(
         "--expected-ids",
@@ -162,6 +161,17 @@ def parse_args() -> argparse.Namespace:
             "first pass already finds all of them. Recovers FPS in static scenes "
             "without sacrificing recognition rate."
         ),
+    )
+    parser.add_argument(
+        "--classifier-model",
+        default=None,
+        help="Path to trained CNN classifier model (.pt) for blurry marker recovery. Enables GPU-accelerated marker ID prediction on rejected candidates.",
+    )
+    parser.add_argument(
+        "--classifier-threshold",
+        type=float,
+        default=0.7,
+        help="Minimum confidence for CNN classifier predictions. Default 0.7.",
     )
     return parser.parse_args()
 
@@ -204,13 +214,17 @@ def parse_expected_ids(spec: str) -> Optional[set[int]]:
 def parse_passes(spec: str, base_enhance: EnhanceConfig) -> list[PassConfig]:
     """Parse a multi-pass spec like '3.5:0.75,1.0,1.5:140;4.5:1.0,2.0:100'.
 
-    Each pass: 'clahe_clip:scales:roi_min_short_side[:sharpen]'. Use 'off' for
-    clahe_clip to disable CLAHE in that pass. The optional 4th field controls
-    sharpen for that pass independently of the global --enhance-sharpen flag:
+    Each pass: 'clahe_clip:scales:roi_min_short_side[:sharpen[:deconv]]'.
+    Use 'off' for clahe_clip to disable CLAHE in that pass.
+    Optional 4th field (sharpen):
       - omitted        → inherit base_enhance.sharpen (back-compat)
       - 'off'          → sharpen disabled for this pass
       - 'on'           → sharpen enabled, amount inherited from --sharpen-amount
       - <float>        → sharpen enabled with that amount
+      - 'amount,radius' → sharpen with specific amount and radius
+    Optional 5th field (deconv):
+      - omitted or '0' → no deconvolution
+      - <int>          → Wiener deconvolution with disc PSF of that radius
 
     Returns [] if spec is empty (caller falls back to legacy single-pass path).
     """
@@ -223,15 +237,16 @@ def parse_passes(spec: str, base_enhance: EnhanceConfig) -> list[PassConfig]:
         if not chunk:
             continue
         parts = chunk.split(":")
-        if len(parts) not in (3, 4):
+        if len(parts) not in (3, 4, 5):
             raise SystemExit(
-                f"--detect-passes pass {chunk!r} must have 3 or 4 fields "
-                f"'clahe_clip:scales:roi_min_short_side[:sharpen]'"
+                f"--detect-passes pass {chunk!r} must have 3-5 fields "
+                f"'clahe_clip:scales:roi_min_short_side[:sharpen[:deconv]]'"
             )
         clip_token = parts[0].strip()
         scales_token = parts[1].strip()
         min_token = parts[2].strip()
-        sharpen_token = parts[3].strip() if len(parts) == 4 else None
+        sharpen_token = parts[3].strip() if len(parts) >= 4 else None
+        deconv_token = parts[4].strip() if len(parts) >= 5 else None
 
         if clip_token.lower() == "off":
             clahe_on = False
@@ -279,6 +294,15 @@ def parse_passes(spec: str, base_enhance: EnhanceConfig) -> list[PassConfig]:
                     ) from exc
                 sharpen_on = True
 
+        deconv_radius = 0
+        if deconv_token is not None and deconv_token != "0":
+            try:
+                deconv_radius = int(deconv_token)
+            except ValueError as exc:
+                raise SystemExit(
+                    f"--detect-passes deconv must be an integer radius, got {deconv_token!r}"
+                ) from exc
+
         passes.append(
             PassConfig(
                 enhance=replace(
@@ -288,6 +312,7 @@ def parse_passes(spec: str, base_enhance: EnhanceConfig) -> list[PassConfig]:
                     sharpen=sharpen_on,
                     sharpen_amount=sharpen_amount,
                     sharpen_radius=sharpen_radius,
+                    deconv_radius=deconv_radius,
                 ),
                 scales=parse_scales(scales_token),
                 roi_min_short_side=max(0, roi_min),
@@ -427,6 +452,15 @@ def main() -> int:
         smooth_deadband=args.smooth_deadband,
         smooth_snap=args.smooth_snap,
     )
+    classifier = None
+    if args.classifier_model:
+        from .cnn_classifier import MarkerClassifier
+        classifier = MarkerClassifier(
+            model_path=args.classifier_model,
+            confidence_threshold=args.classifier_threshold,
+        )
+        print(f"CNN classifier loaded: {args.classifier_model}")
+    recovery = CandidateRecovery(library_hd=args.stag_library, classifier=classifier)
 
     frame_index = 0
     start_time = time.perf_counter()
@@ -490,6 +524,28 @@ def main() -> int:
             async_result = async_det.try_get_results()
             if async_result is not None:
                 observations, new_candidates = async_result
+                # Learn templates from successful detections
+                for obs in observations:
+                    recovery.learn_template(obs.marker_id, frame, obs.corners)
+                # Try to recover unrecognized candidates (throttled to avoid FPS drop)
+                if new_candidates and frame_index % 30 < 2:
+                    recovered = recovery.try_recover(
+                        frame, [c.corners for c in new_candidates]
+                    )
+                    for marker_id, corners, confidence in recovered:
+                        from .models import bbox_from_points
+                        obs = StagObservation(
+                            marker_id=marker_id,
+                            corners=corners,
+                            bbox=bbox_from_points(corners),
+                            pose=None,
+                        )
+                        observations.append(obs)
+                    if recovered:
+                        new_candidates = [
+                            c for c in new_candidates
+                            if not any(np.allclose(c.corners, r[1]) for r in recovered)
+                        ]
                 detector.last_candidates = new_candidates
                 if not args.no_memory:
                     fusion.update(gray, [], observations)
