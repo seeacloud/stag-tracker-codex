@@ -781,6 +781,8 @@ def main() -> int:
                 key = cv2.waitKeyEx(1)
                 if handle_key(key, fusion, args.smooth_step):
                     break
+                if key == ord('p') or key == ord('P'):
+                    show_pipeline_debug(gray, base_enhance, frame)
             t6 = time.perf_counter()
 
             profile_accum["gray"] += t1 - t0
@@ -1064,6 +1066,81 @@ def draw_screen_status(frame, fps: float, active_count: int) -> None:
     width = min(frame.shape[1] - 1, 360)
     cv2.rectangle(frame, (8, 8), (width, 34), (40, 40, 40), -1)
     cv2.putText(frame, text, (14, 27), font, 0.5, (245, 245, 245), 1, cv2.LINE_AA)
+
+
+def show_pipeline_debug(gray: np.ndarray, enhance_config, frame: np.ndarray) -> None:
+    """Show each preprocessing step side by side when user presses P."""
+    from .preprocess import apply_gamma, apply_clahe, apply_unsharp_mask, apply_wiener_deconv
+
+    h, w = gray.shape
+    # Scale down for display
+    scale = 0.5
+    sh, sw = int(h * scale), int(w * scale)
+
+    def resize(img):
+        return cv2.resize(img, (sw, sh))
+
+    def label(img, text):
+        display = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR) if img.ndim == 2 else img.copy()
+        cv2.putText(display, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        return display
+
+    # Step 1: Raw grayscale
+    step1 = resize(gray)
+
+    # Step 2: Gamma correction
+    gamma_img = apply_gamma(gray, enhance_config.gamma) if enhance_config.gamma != 1.0 else gray
+    step2 = resize(gamma_img)
+
+    # Step 3: Wiener deconvolution (if enabled)
+    if enhance_config.deconv_radius > 0:
+        deconv_img = apply_wiener_deconv(gamma_img, enhance_config.deconv_radius, enhance_config.deconv_snr)
+        step3 = resize(deconv_img)
+        step3_label = f"3. Wiener deconv (r={enhance_config.deconv_radius})"
+    else:
+        deconv_img = gamma_img
+        step3 = resize(gamma_img)
+        step3_label = "3. Deconv (off)"
+
+    # Step 4: CLAHE
+    if enhance_config.clahe:
+        clahe_img = apply_clahe(deconv_img, clip=enhance_config.clahe_clip, grid=enhance_config.clahe_grid)
+        step4 = resize(clahe_img)
+        step4_label = f"4. CLAHE (clip={enhance_config.clahe_clip})"
+    else:
+        clahe_img = deconv_img
+        step4 = resize(deconv_img)
+        step4_label = "4. CLAHE (off)"
+
+    # Step 5: Unsharp mask
+    if enhance_config.sharpen:
+        sharp_img = apply_unsharp_mask(clahe_img, amount=enhance_config.sharpen_amount,
+                                       radius=enhance_config.sharpen_radius)
+        step5 = resize(sharp_img)
+        step5_label = f"5. Sharpen (a={enhance_config.sharpen_amount})"
+    else:
+        step5 = resize(clahe_img)
+        step5_label = "5. Sharpen (off)"
+
+    # Step 6: YOLO input (raw BGR frame, resized)
+    step6 = resize(frame)
+
+    # Compose grid: 2 rows x 3 cols
+    row1 = np.hstack([
+        label(step1, "1. Raw grayscale"),
+        label(step2, f"2. Gamma ({enhance_config.gamma})"),
+        label(step3, step3_label),
+    ])
+    row2 = np.hstack([
+        label(step4, step4_label),
+        label(step5, step5_label),
+        label(step6, "6. YOLO input (raw BGR)"),
+    ])
+    grid = np.vstack([row1, row2])
+
+    cv2.imshow("Pipeline Debug (press any key to close)", grid)
+    cv2.waitKey(0)
+    cv2.destroyWindow("Pipeline Debug (press any key to close)")
 
 
 def handle_key(key: int, fusion: FusionTracker, step: float) -> bool:
