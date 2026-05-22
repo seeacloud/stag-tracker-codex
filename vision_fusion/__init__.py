@@ -2,6 +2,7 @@
 
 __all__ = [
     "candidate_recovery",
+    "ccv_preprocess",
     "cnn_classifier",
     "fusion",
     "kalman_predictor",
@@ -9,6 +10,7 @@ __all__ = [
     "optical_flow",
     "stag_detector",
     "temporal_voter",
+    "topology_locator",
     "visualization",
     "yolo_detector",
 ]

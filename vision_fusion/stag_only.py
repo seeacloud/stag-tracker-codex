@@ -15,7 +15,9 @@ import numpy as np
 from .fusion import FusionTracker
 from .kalman_predictor import KalmanPredictor
 from .candidate_recovery import CandidateRecovery
+from .ccv_preprocess import CCVConfig, CCVPreprocessor
 from .temporal_voter import TemporalVoter
+from .topology_locator import TopologyLocator
 from .models import BBox, StagCandidate, StagObservation, Track, clip_bbox
 from .optical_flow import OpticalFlowTracker
 from .preprocess import EnhanceConfig
@@ -174,6 +176,14 @@ def parse_args() -> argparse.Namespace:
         default=0.7,
         help="Minimum confidence for CNN classifier predictions. Default 0.7.",
     )
+    parser.add_argument(
+        "--ccv-mode",
+        action="store_true",
+        help="Enable CCV-style preprocessing pipeline (bg-sub + highpass + amplify + adaptive threshold). Press B to capture background.",
+    )
+    parser.add_argument("--ccv-amplify", type=float, default=4.0, help="CCV contrast amplification factor.")
+    parser.add_argument("--ccv-highpass-blur", type=int, default=29, help="CCV highpass blur radius.")
+    parser.add_argument("--ccv-threshold-tile", type=int, default=21, help="CCV adaptive threshold tile size.")
     parser.add_argument(
         "--yolo-model",
         default=None,
@@ -508,6 +518,20 @@ def main() -> int:
         )
         print(f"CNN classifier loaded: {args.classifier_model}")
     recovery = CandidateRecovery(library_hd=args.stag_library, classifier=classifier)
+
+    ccv_preprocessor = None
+    topology_locator = None
+    show_ccv_stages = False
+    if args.ccv_mode:
+        ccv_config = CCVConfig(
+            amplify=args.ccv_amplify,
+            highpass_blur=args.ccv_highpass_blur,
+            threshold_tile=args.ccv_threshold_tile,
+        )
+        ccv_preprocessor = CCVPreprocessor(ccv_config)
+        topology_locator = TopologyLocator()
+        show_ccv_stages = True
+        print("CCV mode enabled. Press B to capture background. Press V to toggle stages window.")
     temporal_voter = TemporalVoter(window=8, min_votes=3, max_drift_px=20.0)
     yolo_locator = None
     if args.yolo_model:
@@ -618,14 +642,37 @@ def main() -> int:
 
                 detector.last_candidates = new_candidates
 
-            # YOLO locator: find ALL markers (including blurry ones STag missed)
-            # Runs every frame independently of async STag results
+            # Collect localizer regions from topology + YOLO
+            locator_regions: list = []
+            binary = None
+            if ccv_preprocessor is not None and ccv_preprocessor.has_background():
+                binary = ccv_preprocessor.process(gray)
+
+            if topology_locator is not None and binary is not None:
+                existing_bboxes_topo = [obs.bbox for obs in observations]
+                existing_bboxes_topo += [t.bbox for t in fusion.tracks]
+                locator_regions.extend(topology_locator.locate(binary, existing_bboxes_topo))
+
             if yolo_locator is not None:
                 existing_bboxes = [obs.bbox for obs in observations]
                 existing_bboxes += [t.bbox for t in fusion.tracks]
-                yolo_regions = yolo_locator.locate(frame, existing_bboxes)
-
+                # YOLO input: binary (3-channel) if CCV active, else raw frame
+                yolo_input = cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR) if binary is not None else frame
+                yolo_regions = yolo_locator.locate(yolo_input, existing_bboxes)
+                # Merge: skip yolo regions that overlap with topology results
                 for corners, bbox in yolo_regions:
+                    cx = bbox[0] + bbox[2] / 2
+                    cy = bbox[1] + bbox[3] / 2
+                    overlaps = any(
+                        lb[0] <= cx <= lb[0] + lb[2] and lb[1] <= cy <= lb[1] + lb[3]
+                        for _, lb in locator_regions
+                    )
+                    if not overlaps:
+                        locator_regions.append((corners, bbox))
+
+            # Decode each located region: try STag, fall back to CNN
+            if locator_regions:
+                for corners, bbox in locator_regions:
                     # Step 1: try STag decode on this region
                     import stag as _stag
                     x, y, w, h = bbox
@@ -687,7 +734,12 @@ def main() -> int:
             should_detect = got_new_frame and frame_index % max(1, args.detect_interval) == 0
             if should_detect:
                 rois = detection_rois(frame, fusion.tracks, args, frame_index, screen_mapper)
-                async_det.submit(frame, rois)
+                # CCV mode: run STag on the binary preprocessed image (sharper edges)
+                detect_frame = frame
+                if ccv_preprocessor is not None and ccv_preprocessor.has_background():
+                    binary = ccv_preprocessor.process(gray)
+                    detect_frame = cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
+                async_det.submit(detect_frame, rois)
             t3 = time.perf_counter()
 
             if not args.no_memory and predicted and not updated:
@@ -777,12 +829,50 @@ def main() -> int:
                 cv2.imshow("STag only", annotated)
                 if screen_view is not None and not args.no_screen_view:
                     cv2.imshow("Screen view", screen_view)
+                # Live CCV stages window — updates every frame for real-time tuning
+                if show_ccv_stages and ccv_preprocessor is not None:
+                    render_ccv_stages_live(ccv_preprocessor, gray)
             if args.show:
                 key = cv2.waitKeyEx(1)
                 if handle_key(key, fusion, args.smooth_step):
                     break
                 if key == ord('p') or key == ord('P'):
-                    show_pipeline_debug(gray, base_enhance, frame)
+                    show_pipeline_debug(gray, base_enhance, frame, ccv_preprocessor)
+                if key == ord('b') or key == ord('B'):
+                    if ccv_preprocessor is not None:
+                        ccv_preprocessor.capture_background(gray)
+                        print("CCV background captured.")
+                if key == ord('v') or key == ord('V'):
+                    show_ccv_stages = not show_ccv_stages
+                    if not show_ccv_stages:
+                        try: cv2.destroyWindow("CCV Pipeline (live)")
+                        except: pass
+                    print(f"CCV stages window: {'ON' if show_ccv_stages else 'OFF'}")
+                # CCV live tuning keys
+                if ccv_preprocessor is not None and key >= 0:
+                    cfg = ccv_preprocessor.config
+                    changed = False
+                    if key == ord('1'):
+                        cfg.amplify = max(1.0, cfg.amplify - 0.5); changed = True
+                    elif key == ord('2'):
+                        cfg.amplify += 0.5; changed = True
+                    elif key == ord('3'):
+                        cfg.threshold_tile = max(3, (cfg.threshold_tile - 2) | 1); changed = True
+                    elif key == ord('4'):
+                        cfg.threshold_tile = (cfg.threshold_tile + 2) | 1; changed = True
+                    elif key == ord('5'):
+                        cfg.threshold_c = max(0, cfg.threshold_c - 1); changed = True
+                    elif key == ord('6'):
+                        cfg.threshold_c += 1; changed = True
+                    elif key == ord('7'):
+                        cfg.highpass_blur = max(3, (cfg.highpass_blur - 4) | 1); changed = True
+                    elif key == ord('8'):
+                        cfg.highpass_blur = (cfg.highpass_blur + 4) | 1; changed = True
+                    elif key == ord('i') or key == ord('I'):
+                        cfg.invert = not cfg.invert; changed = True
+                    if changed:
+                        print(f"CCV: amplify={cfg.amplify:.1f} tile={cfg.threshold_tile} "
+                              f"c={cfg.threshold_c} hp_blur={cfg.highpass_blur} invert={cfg.invert}")
             t6 = time.perf_counter()
 
             profile_accum["gray"] += t1 - t0
@@ -1068,12 +1158,50 @@ def draw_screen_status(frame, fps: float, active_count: int) -> None:
     cv2.putText(frame, text, (14, 27), font, 0.5, (245, 245, 245), 1, cv2.LINE_AA)
 
 
-def show_pipeline_debug(gray: np.ndarray, enhance_config, frame: np.ndarray) -> None:
+def render_ccv_stages_live(ccv, gray: np.ndarray) -> None:
+    """Display all CCV pipeline stages in one combined window for real-time tuning.
+
+    Mimics CCV's bottom-row stage thumbnails. Shows current stage outputs side-by-side
+    with current parameter values overlaid. Updates every frame.
+    """
+    _, stages = ccv.process(gray, return_stages=True)
+    cfg = ccv.config
+
+    h, w = gray.shape
+    tw = 320
+    th = int(h * tw / w)
+
+    def thumb(img, text):
+        small = cv2.resize(img, (tw, th))
+        if small.ndim == 2:
+            small = cv2.cvtColor(small, cv2.COLOR_GRAY2BGR)
+        cv2.rectangle(small, (0, 0), (tw, 28), (0, 0, 0), -1)
+        cv2.putText(small, text, (5, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+        return small
+
+    has_bg = ccv.has_background()
+    bg_label = "1. BG Subtract" if has_bg else "1. BG Subtract (press B!)"
+    row1 = np.hstack([
+        thumb(stages["raw"], "0. Raw grayscale"),
+        thumb(stages["bg_sub"], bg_label),
+        thumb(stages["smooth"], f"2. Smooth (k={cfg.smooth_ksize})"),
+    ])
+    row2 = np.hstack([
+        thumb(stages["highpass"], f"3. Highpass (blur={cfg.highpass_blur} 7/8)"),
+        thumb(stages["amplify"], f"4. Amplify ({cfg.amplify:.1f} 1/2)"),
+        thumb(stages["binary"],
+              f"5. Binary (tile={cfg.threshold_tile} 3/4 c={cfg.threshold_c} 5/6)"),
+    ])
+    grid = np.vstack([row1, row2])
+    cv2.imshow("CCV Pipeline (live)", grid)
+
+
+def show_pipeline_debug(gray: np.ndarray, enhance_config, frame: np.ndarray,
+                        ccv_preprocessor=None) -> None:
     """Show each preprocessing step side by side when user presses P."""
     from .preprocess import apply_gamma, apply_clahe, apply_unsharp_mask, apply_wiener_deconv
 
     h, w = gray.shape
-    # Scale down for display
     scale = 0.5
     sh, sw = int(h * scale), int(w * scale)
 
@@ -1085,14 +1213,30 @@ def show_pipeline_debug(gray: np.ndarray, enhance_config, frame: np.ndarray) -> 
         cv2.putText(display, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         return display
 
-    # Step 1: Raw grayscale
-    step1 = resize(gray)
+    # If CCV mode active and has background, show CCV pipeline
+    if ccv_preprocessor is not None and ccv_preprocessor.has_background():
+        _, stages = ccv_preprocessor.process(gray, return_stages=True)
+        row1 = np.hstack([
+            label(resize(stages["raw"]), "1. Raw grayscale"),
+            label(resize(stages["bg_sub"]), "2. BG Subtract"),
+            label(resize(stages["smooth"]), "3. Smooth"),
+        ])
+        row2 = np.hstack([
+            label(resize(stages["highpass"]), "4. Highpass"),
+            label(resize(stages["amplify"]), "5. Amplify"),
+            label(resize(stages["binary"]), "6. Binary (STag input)"),
+        ])
+        grid = np.vstack([row1, row2])
+        cv2.imshow("CCV Pipeline Debug (any key to close)", grid)
+        cv2.waitKey(0)
+        cv2.destroyWindow("CCV Pipeline Debug (any key to close)")
+        return
 
-    # Step 2: Gamma correction
+    # Standard preprocessing pipeline
+    step1 = resize(gray)
     gamma_img = apply_gamma(gray, enhance_config.gamma) if enhance_config.gamma != 1.0 else gray
     step2 = resize(gamma_img)
 
-    # Step 3: Wiener deconvolution (if enabled)
     if enhance_config.deconv_radius > 0:
         deconv_img = apply_wiener_deconv(gamma_img, enhance_config.deconv_radius, enhance_config.deconv_snr)
         step3 = resize(deconv_img)
@@ -1102,7 +1246,6 @@ def show_pipeline_debug(gray: np.ndarray, enhance_config, frame: np.ndarray) -> 
         step3 = resize(gamma_img)
         step3_label = "3. Deconv (off)"
 
-    # Step 4: CLAHE
     if enhance_config.clahe:
         clahe_img = apply_clahe(deconv_img, clip=enhance_config.clahe_clip, grid=enhance_config.clahe_grid)
         step4 = resize(clahe_img)
@@ -1112,7 +1255,6 @@ def show_pipeline_debug(gray: np.ndarray, enhance_config, frame: np.ndarray) -> 
         step4 = resize(deconv_img)
         step4_label = "4. CLAHE (off)"
 
-    # Step 5: Unsharp mask
     if enhance_config.sharpen:
         sharp_img = apply_unsharp_mask(clahe_img, amount=enhance_config.sharpen_amount,
                                        radius=enhance_config.sharpen_radius)
@@ -1122,10 +1264,8 @@ def show_pipeline_debug(gray: np.ndarray, enhance_config, frame: np.ndarray) -> 
         step5 = resize(clahe_img)
         step5_label = "5. Sharpen (off)"
 
-    # Step 6: YOLO input (raw BGR frame, resized)
     step6 = resize(frame)
 
-    # Compose grid: 2 rows x 3 cols
     row1 = np.hstack([
         label(step1, "1. Raw grayscale"),
         label(step2, f"2. Gamma ({enhance_config.gamma})"),

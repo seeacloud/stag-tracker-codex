@@ -158,6 +158,8 @@ def main() -> int:
     parser.add_argument("--camera-fps", type=float, default=60)
     parser.add_argument("--camera-fourcc", default="MJPG")
     parser.add_argument("--camera-backend", choices=("any", "dshow", "msmf"), default="msmf")
+    parser.add_argument("--ccv-mode", action="store_true",
+                        help="Save binary CCV-preprocessed frames instead of raw. Press B to capture background.")
     args = parser.parse_args()
 
     from ..camera_picker import camera_backend
@@ -186,9 +188,29 @@ def main() -> int:
     print("Mark all markers in frame (4 clicks each), then S to save + next frame")
     print("N=skip frame, Z=undo, Q=quit")
 
+    ccv_preprocessor = None
+    if args.ccv_mode:
+        from ..ccv_preprocess import CCVPreprocessor
+        ccv_preprocessor = CCVPreprocessor()
+        print("CCV mode: press B (in OpenCV window) to capture background, then label binary frames.")
+
+    def grab_frame():
+        ok, raw = cap.read()
+        if not ok:
+            return None
+        if ccv_preprocessor is not None and ccv_preprocessor.has_background():
+            gray = cv2.cvtColor(raw, cv2.COLOR_BGR2GRAY)
+            binary = ccv_preprocessor.process(gray)
+            return cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
+        return raw
+
+    def grab_raw_for_bg():
+        ok, raw = cap.read()
+        return raw if ok else None
+
     # Grab first frame
-    ok, frame = cap.read()
-    if not ok:
+    frame = grab_frame()
+    if frame is None:
         print("ERROR: No frame from camera", file=sys.stderr)
         return 1
     tool.frame = frame
@@ -202,22 +224,30 @@ def main() -> int:
             key = cv2.waitKey(50) & 0xFF
             if key == ord('q') or key == 27:
                 break
+            elif key == ord('b') or key == ord('B'):
+                if ccv_preprocessor is not None:
+                    raw_bg = grab_raw_for_bg()
+                    if raw_bg is not None:
+                        gray_bg = cv2.cvtColor(raw_bg, cv2.COLOR_BGR2GRAY)
+                        ccv_preprocessor.capture_background(gray_bg)
+                        tool.message = "CCV background captured."
+                        new_frame = grab_frame()
+                        if new_frame is not None:
+                            tool.frame = new_frame
             elif key == ord('s'):
                 if tool.save_frame():
-                    # Advance to next frame
-                    ok, frame = cap.read()
-                    if not ok:
+                    new_frame = grab_frame()
+                    if new_frame is None:
                         print("End of video source")
                         break
-                    tool.frame = frame
+                    tool.frame = new_frame
                     tool.message = "Saved! Mark next frame, then S"
             elif key == ord('n'):
-                # Skip without saving
-                ok, frame = cap.read()
-                if not ok:
+                new_frame = grab_frame()
+                if new_frame is None:
                     print("End of video source")
                     break
-                tool.frame = frame
+                tool.frame = new_frame
                 tool.boxes.clear()
                 tool.points.clear()
                 tool.message = "Skipped. Mark this frame or N again"
