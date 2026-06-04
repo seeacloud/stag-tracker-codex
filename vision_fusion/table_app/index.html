@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="zh">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Scent Interface · Table</title>
+    <link rel="stylesheet" href="/styles.css?v=20260604" />
+  </head>
+  <body>
+    <div id="stage" aria-label="Scent Interface Table">
+      <canvas id="fx"></canvas>
+      <div id="layers" aria-live="polite"></div>
+      <div id="compare" class="compare-card is-hidden" role="status"></div>
+      <div id="standby" class="standby">
+        <div class="brand">SCENT INTERFACE</div>
+      </div>
+      <div id="status" class="status is-hidden">重连中</div>
+    </div>
+
+    <script type="module" src="/renderer.js?v=20260604"></script>
+  </body>
+</html>
