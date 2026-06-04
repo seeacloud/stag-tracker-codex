@@ -1,14 +1,13 @@
 import { CATALOG } from "./catalog.js";
 import { ID_MAPPING } from "./id_mapping.js";
 import { similarity, topDifferences } from "./scent.js";
-import { makeResolver, proximityState, NEAR, FAR } from "./model.js";
+import { makeResolver, proximityState } from "./model.js";
 
 const resolve = makeResolver(CATALOG, ID_MAPPING);
 
 // 背投镜像兜底：硬件已镜像则保持 false（按实测调）。
 const MIRROR_X = false;
 const RING_RADIUS = 140;     // 卡片环半径(px)
-const CARD_SLOTS = 4;        // 一圈最多排几张卡片
 const EASE = 0.18;           // 位置/角度插值系数
 const SIM_LINE_MIN = 0.3;    // 相似度低于此不画连线
 
@@ -63,6 +62,7 @@ function syncTracks(objects) {
     const tx = normX(Number(obj.x));
     const ty = Number(obj.y) * H;
     const tAngle = Number(obj.angle) || 0;
+    if (!Number.isFinite(tx) || !Number.isFinite(ty)) continue;
     let track = tracks.get(id);
     if (!track || track.symbolId !== Number(obj.symbolId)) {
       if (track) removeTrack(id);
@@ -87,6 +87,8 @@ function createTrack(id, symbolId, x, y, angle) {
   const cards = buildCards(info);
   for (const c of cards) el.appendChild(c);
   layers.appendChild(el);
+  // 强制 reflow，让 is-enter 的 opacity:0 先提交，过渡才会播放
+  for (const c of cards) void c.offsetWidth;
   // 下一帧去掉 is-enter 触发绽放动画
   requestAnimationFrame(() => {
     for (const c of cards) c.classList.remove("is-enter");
@@ -141,18 +143,23 @@ function cardEl(extra = "") {
 let bgT = 0;
 
 function frame() {
-  bgT += 0.005;
-  // 插值靠近目标
-  for (const track of tracks.values()) {
-    track.x += (track.tx - track.x) * EASE;
-    track.y += (track.ty - track.y) * EASE;
-    track.angle += angleDelta(track.angle, track.tAngle) * EASE;
+  try {
+    bgT += 0.005;
+    // 插值靠近目标
+    for (const track of tracks.values()) {
+      track.x += (track.tx - track.x) * EASE;
+      track.y += (track.ty - track.y) * EASE;
+      track.angle += angleDelta(track.angle, track.tAngle) * EASE;
+    }
+    drawBackground();
+    drawLinks();
+    layoutCards();
+    updateCompare();
+  } catch (err) {
+    console.error("frame error", err);
+  } finally {
+    requestAnimationFrame(frame);
   }
-  drawBackground();
-  drawLinks();
-  layoutCards();
-  updateCompare();
-  requestAnimationFrame(frame);
 }
 
 function angleDelta(from, to) {
