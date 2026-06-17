@@ -68,3 +68,35 @@ def test_decode_id_rejects_short_or_x_in_data():
     assert decode_id("007") == -1     # 不足 4 位
     assert decode_id("0X34") == -1    # 前 3 位出现 X（数据位不该有 X）
 
+
+try:
+    import rapidocr_onnxruntime  # noqa: F401
+    _HAS_OCR = True
+except Exception:
+    _HAS_OCR = False
+
+
+@pytest.mark.skipif(not _HAS_OCR, reason="rapidocr-onnxruntime not installed")
+def test_recognize_real_markers():
+    """在用户导出的真实 marker(digit_markers_tri)上端到端读 ID。
+
+    用部署用的实际 marker（用户参数、大字），不是默认小字合成图。
+    """
+    from pathlib import Path
+    from vision_fusion.digit_detect_tri import DigitRecognizerTri
+    mdir = Path("digit_markers_tri")
+    samples = []
+    for mid in (83, 7, 20, 99):          # 含 X(007X) 与普通
+        hits = sorted(mdir.glob(f"digit_{mid:03d}_*.png"))
+        if hits:
+            samples.append((mid, hits[0]))
+    if not samples:
+        pytest.skip("digit_markers_tri 里无导出 marker")
+    rec = DigitRecognizerTri()
+    for mid, p in samples:
+        img = cv2.imread(str(p), cv2.IMREAD_GRAYSCALE)
+        got, _ = rec.recognize(img, min_conf=0.0)
+        assert got == mid, f"id {mid} read as {got}"
+
+
+

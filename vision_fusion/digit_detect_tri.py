@@ -69,3 +69,45 @@ def decode_id(chars: str) -> int:
         return -1
     mid = int(s[:3])
     return mid if checksum_char(mid) == s[3] else -1
+
+
+class DigitRecognizerTri:
+    """RapidOCR(PP-OCR) 读 2×2 数字带 + 加权 mod11+X 校验。"""
+
+    def __init__(self):
+        from rapidocr_onnxruntime import RapidOCR  # 懒加载，缺依赖不影响纯逻辑
+        self.reader = RapidOCR()
+
+    def _ocr(self, crop: np.ndarray) -> tuple[str, float]:
+        if crop.ndim == 2:
+            crop = cv2.cvtColor(crop, cv2.COLOR_GRAY2BGR)
+        # 位置已知，DBNet 检测在低对比噪声带上会失败 → rec-only。
+        result, _ = self.reader(crop, use_det=False, use_cls=False, use_rec=True)
+        if not result:
+            return "", 0.0
+        text = "".join(r[0] for r in result)
+        conf = float(np.mean([r[1] for r in result]))
+        return text, conf
+
+    def recognize(self, square: np.ndarray, min_conf: float = 0.5) -> tuple[int, float]:
+        oriented, ok = orient_by_triangle(square)
+        if not ok:
+            return -1, 0.0
+        h, w = oriented.shape[:2]
+        # 上下对半分，各含一行两个数字（全宽两列）。大字 marker 两行几乎占满高度，
+        # 固定窄带会把两行搅在一起；对半切对各种字号/行距都稳。三角在上半左上角，
+        # 占比小，RapidOCR rec 仍聚焦数字（实测 "08" 0.96 conf）。
+        x0, x1 = int(w * 0.12), int(w * 0.88)
+        top = oriented[int(h * 0.12):int(h * 0.50), x0:x1]
+        bot = oriented[int(h * 0.50):int(h * 0.88), x0:x1]
+        top = cv2.resize(top, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
+        bot = cv2.resize(bot, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
+        t_txt, t_c = self._ocr(top)
+        b_txt, b_c = self._ocr(bot)
+        if not (t_txt and b_txt):
+            return -1, 0.0
+        conf = (t_c + b_c) / 2.0
+        if conf < min_conf:
+            return -1, 0.0
+        mid = decode_id(t_txt + b_txt)
+        return (mid, conf) if mid >= 0 else (-1, 0.0)
