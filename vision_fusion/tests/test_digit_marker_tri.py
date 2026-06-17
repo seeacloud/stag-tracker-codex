@@ -100,3 +100,11 @@ def test_main_batch_exports_range(tmp_path, monkeypatch):
     assert len(pngs) == 21
     # 文件名带校验位：5 → 005 + checksum
     assert (out / f"digit_005_{checksum_char(5)}.png").exists()
+
+
+def test_ui_reuses_core_not_copies():
+    from vision_fusion import digit_marker_tri_ui as ui
+    from vision_fusion import digit_marker_tri as core
+    assert ui.generate_marker_tri is core.generate_marker_tri
+    assert ui.checksum_char is core.checksum_char
+
