@@ -99,4 +99,12 @@ def test_recognize_real_markers():
         assert got == mid, f"id {mid} read as {got}"
 
 
+def test_module_api_exists():
+    import vision_fusion.digit_detect_tri as m
+    for name in ["find_triangle_corner", "orient_by_triangle", "decode_id",
+                 "DigitRecognizerTri", "main"]:
+        assert hasattr(m, name)
+
+
+
 

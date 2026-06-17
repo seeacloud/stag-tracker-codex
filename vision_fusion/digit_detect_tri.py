@@ -111,3 +111,86 @@ class DigitRecognizerTri:
             return -1, 0.0
         mid = decode_id(t_txt + b_txt)
         return (mid, conf) if mid >= 0 else (-1, 0.0)
+
+
+def main() -> int:
+    from ultralytics import YOLO
+    from .digit_detect import (order_corners, warp_square, draw_corners,
+                               marker_up_vector, id_anchor)
+
+    parser = argparse.ArgumentParser(description="Digit marker (tri) decoder.")
+    parser.add_argument("--source", default="0")
+    parser.add_argument("--model", default="models/tri_marker_obb.pt")
+    parser.add_argument("--conf", type=float, default=0.3)
+    parser.add_argument("--mirror", action="store_true", default=False)
+    parser.add_argument("--camera-exposure", type=int, default=None)
+    args = parser.parse_args()
+
+    yolo = YOLO(args.model)
+    recognizer = DigitRecognizerTri()
+    clahe = cv2.createCLAHE(clipLimit=5.0, tileGridSize=(8, 8))
+    win = "Digit Marker TRI"
+
+    src = int(args.source) if args.source.isdigit() else args.source
+    cap = cv2.VideoCapture(src, cv2.CAP_DSHOW)
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    exposure = args.camera_exposure if args.camera_exposure is not None else -6
+    cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
+    cap.set(cv2.CAP_PROP_EXPOSURE, exposure)
+    cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+    print("Digit Marker TRI decoder. Esc=quit.")
+
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        if args.mirror:
+            frame = cv2.flip(frame, 1)
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        enhanced = clahe.apply(gray)
+        results = yolo(cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR), verbose=False, conf=args.conf)
+
+        disp = frame
+        n_ok = 0
+        for r in results:
+            if r.obb is None:
+                continue
+            for i in range(len(r.obb)):
+                pts = r.obb.xyxyxyxy[i].cpu().numpy().reshape(4, 2)
+                square = warp_square(enhanced, pts, size=200)
+                if square.size == 0:
+                    continue
+                marker_id, _conf = recognizer.recognize(square)
+                corner, _ = find_triangle_corner(square)
+                center = pts.mean(axis=0)
+                if marker_id >= 0:
+                    n_ok += 1
+                    draw_corners(disp, pts, color=(0, 220, 0))
+                    anchor = id_anchor(pts, corner)
+                    cv2.putText(disp, f"{marker_id:03d}", (int(anchor[0]) - 14, int(anchor[1]) + 6),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 220, 0), 1, cv2.LINE_AA)
+                    mc, up = marker_up_vector(pts, corner)
+                    ordered = order_corners(pts)
+                    arrow_len = 0.6 * np.hypot(*(ordered[0] - mc))
+                    tip = (int(mc[0] + up[0] * arrow_len), int(mc[1] + up[1] * arrow_len))
+                    cv2.arrowedLine(disp, (int(mc[0]), int(mc[1])), tip,
+                                    (0, 0, 255), 1, cv2.LINE_AA, tipLength=0.3)
+                else:
+                    draw_corners(disp, pts, color=(0, 180, 180))
+                    cv2.putText(disp, "?", (int(center[0]) - 5, int(center[1]) + 5),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 180, 180), 1, cv2.LINE_AA)
+
+        cv2.putText(disp, f"IDs:{n_ok}", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1)
+        cv2.imshow(win, disp)
+        if (cv2.waitKey(1) & 0xFF) == 27:
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
