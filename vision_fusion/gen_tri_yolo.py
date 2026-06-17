@@ -11,50 +11,38 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import json
 import math
 import random
-from functools import lru_cache
 from pathlib import Path
 
 import cv2
 import numpy as np
 
 from .nn_synth_ui import overlay_marker, load_settings, CANVAS_W, CANVAS_H
-from .digit_marker_tri import generate_marker_tri
-
-# marker 渲染参数（来自用户在 GUI 保存的 digit_marker_tri_settings.json）。
-# main() 启动时填充；_marker 据此渲染，保证合成 marker 与用户调好的外观一致。
-_MARKER_PARAMS: dict = {}
-_MARKER_PX = 300
-_PARAM_KEYS = ("font_size_ratio", "border_ratio", "chamfer_ratio", "pad_ratio",
-               "col_gap_ratio", "row_gap_ratio", "stroke_ratio", "font_path")
 
 
-def load_marker_params(path: str = "digit_marker_tri_settings.json") -> dict:
-    """读用户保存的 marker 外观参数；没有则空 dict（generate_marker_tri 用默认）。"""
-    p = Path(path)
-    if p.is_file():
-        try:
-            s = json.loads(p.read_text(encoding="utf-8"))
-            return {k: s[k] for k in _PARAM_KEYS if k in s}
-        except (json.JSONDecodeError, OSError):
-            pass
-    return {}
+def load_markers(markers_dir: str) -> dict:
+    """加载用户导出的 tri marker PNG（digit_{id:03d}_{check}.png，灰度）。
 
-
-@lru_cache(maxsize=1024)
-def _marker(mid: int) -> np.ndarray:
-    """渲染并缓存一枚 tri marker（灰度），用用户参数；供 overlay_marker 贴图。"""
-    return generate_marker_tri(mid, pixels=_MARKER_PX, **_MARKER_PARAMS)
+    直接用用户生成的图本身（含其 GUI 调好的字体/字号/三角等），保证合成 marker 与
+    将来打印/部署的完全一致——不重渲染，避免字体路径解析/参数偏差导致字号偏小。
+    """
+    d = Path(markers_dir)
+    markers: dict[int, np.ndarray] = {}
+    for mid in range(1000):
+        hits = sorted(d.glob(f"digit_{mid:03d}_*.png"))
+        if hits:
+            img = cv2.imread(str(hits[0]), cv2.IMREAD_GRAYSCALE)
+            if img is not None:
+                markers[mid] = img
+    return markers
 
 
 def _candidate_corners(cx: float, cy: float, angle_deg: float, scale: float,
-                       marker_px: int = None) -> np.ndarray:
+                       marker_px: int) -> np.ndarray:
     """复现 overlay_marker 的四角：以 (cx,cy) 为心、边长 max(16,int(px*scale)) 的
     方块绕中心旋转 angle。画之前先拿到角点做重叠检测。"""
-    px = marker_px if marker_px is not None else _MARKER_PX
-    s = max(16, int(px * scale))
+    s = max(16, int(marker_px * scale))
     half = s / 2.0
     a = math.radians(angle_deg)
     cos_a, sin_a = math.cos(a), math.sin(a)
@@ -103,19 +91,24 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="tri marker YOLO-OBB dataset generator.")
     ap.add_argument("--count", type=int, default=800, help="场景数。")
     ap.add_argument("--output", default="datasets/tri_det")
+    ap.add_argument("--markers-dir", default="digit_markers_tri",
+                    help="用户导出的 tri marker PNG 目录(digit_NNN_*.png)。")
     ap.add_argument("--source", default="0")
-    ap.add_argument("--id-max", type=int, default=999, help="随机 marker ID 上界(0..id-max)。")
+    ap.add_argument("--id-max", type=int, default=999, help="只用 ID ≤ 此值的 marker。")
     ap.add_argument("--per-scene-min", type=int, default=6)
     ap.add_argument("--per-scene-max", type=int, default=16)
     ap.add_argument("--val-ratio", type=float, default=0.15)
     ap.add_argument("--no-camera", action="store_true", help="不开摄像头，用灰底兜底背景。")
     args = ap.parse_args()
 
-    # 用用户保存的 marker 外观参数渲染（不是 generate_marker_tri 的默认值）。
-    global _MARKER_PARAMS
-    _MARKER_PARAMS = load_marker_params()
-    _marker.cache_clear()
-    print(f"marker params: {sorted(_MARKER_PARAMS.keys()) or 'NONE → defaults'}")
+    # 直接载入用户导出的 marker PNG（不重渲染，外观与部署一致）。
+    markers = load_markers(args.markers_dir)
+    available = [m for m in sorted(markers) if m <= args.id_max]
+    if not available:
+        print(f"ERROR: {args.markers_dir} 里没找到 digit_NNN_*.png。"
+              f"先用 GUI/CLI 导出 tri marker 到该目录。")
+        return 1
+    print(f"loaded {len(available)} markers from {args.markers_dir}")
 
     s = load_settings()
     params = dict(brightness=s.get("brightness", 100.0), contrast=s.get("contrast", 0.5),
@@ -155,17 +148,17 @@ def main() -> int:
         for _ in range(target):
             # 拒绝采样：最多试 40 次找一个不与已放 marker 交叠的位置；找不到就放弃这一个。
             for _attempt in range(40):
-                mid = rng.randint(0, args.id_max)
+                mid = rng.choice(available)
                 cx = rng.randint(80, CANVAS_W - 80)
                 cy = rng.randint(80, CANVAS_H - 80)
                 ang = rng.uniform(-180, 180)
                 sc = rng.uniform(0.18, 0.5)
-                corners = _candidate_corners(cx, cy, ang, sc)
+                corners = _candidate_corners(cx, cy, ang, sc, markers[mid].shape[1])
                 if not _overlaps(corners, placed):
                     break
             else:
                 continue  # 这一个没找到空位，跳过（宁可少放也不重叠）
-            scene, corners, _ = overlay_marker(scene, _marker(mid), cx, cy, ang, sc, **params)
+            scene, corners, _ = overlay_marker(scene, markers[mid], cx, cy, ang, sc, **params)
             placed.append(corners)
             labels.append(yolo_obb_label(corners, CANVAS_W, CANVAS_H))
         scene = np.clip(scene.astype(np.float32) +
