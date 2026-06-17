@@ -89,28 +89,35 @@ class DigitRecognizerTri:
         conf = float(np.mean([r[1] for r in result]))
         return text, conf
 
-    def recognize(self, square: np.ndarray, min_conf: float = 0.5) -> tuple[int, float]:
+    def read_debug(self, square: np.ndarray) -> tuple[int, float, dict]:
+        """识别并返回中间量（定向/两行 OCR 原文）供调试。"""
+        corner, oconf = find_triangle_corner(square)
         oriented, ok = orient_by_triangle(square)
+        info = {"orient_ok": ok, "orient_conf": oconf, "corner": corner,
+                "top": "", "bot": "", "top_conf": 0.0, "bot_conf": 0.0}
         if not ok:
-            return -1, 0.0
+            return -1, 0.0, info
         h, w = oriented.shape[:2]
-        # 上下对半分，各含一行两个数字（全宽两列）。大字 marker 两行几乎占满高度，
-        # 固定窄带会把两行搅在一起；对半切对各种字号/行距都稳。三角在上半左上角，
-        # 占比小，RapidOCR rec 仍聚焦数字（实测 "08" 0.96 conf）。
         x0, x1 = int(w * 0.12), int(w * 0.88)
-        top = oriented[int(h * 0.12):int(h * 0.50), x0:x1]
-        bot = oriented[int(h * 0.50):int(h * 0.88), x0:x1]
-        top = cv2.resize(top, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
-        bot = cv2.resize(bot, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
+        top = cv2.resize(oriented[int(h * 0.12):int(h * 0.50), x0:x1], None,
+                         fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
+        bot = cv2.resize(oriented[int(h * 0.50):int(h * 0.88), x0:x1], None,
+                         fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
         t_txt, t_c = self._ocr(top)
         b_txt, b_c = self._ocr(bot)
+        info.update(top=t_txt, bot=b_txt, top_conf=t_c, bot_conf=b_c,
+                    _oriented=oriented, _top=top, _bot=bot)
         if not (t_txt and b_txt):
-            return -1, 0.0
+            return -1, 0.0, info
         conf = (t_c + b_c) / 2.0
-        if conf < min_conf:
-            return -1, 0.0
         mid = decode_id(t_txt + b_txt)
-        return (mid, conf) if mid >= 0 else (-1, 0.0)
+        return (mid if mid >= 0 else -1), conf, info
+
+    def recognize(self, square: np.ndarray, min_conf: float = 0.5) -> tuple[int, float]:
+        mid, conf, _ = self.read_debug(square)
+        if mid < 0 or conf < min_conf:
+            return -1, 0.0
+        return mid, conf
 
 
 def main() -> int:
@@ -124,7 +131,19 @@ def main() -> int:
     parser.add_argument("--conf", type=float, default=0.3)
     parser.add_argument("--mirror", action="store_true", default=False)
     parser.add_argument("--camera-exposure", type=int, default=None)
+    parser.add_argument("--debug-dir", default=None,
+                        help="存每个检出 marker 的定向/裁切图 + decode_log.txt(OCR 原文)供调试。")
     args = parser.parse_args()
+
+    dbg = None
+    dbg_log = None
+    dbg_n = 0
+    if args.debug_dir:
+        from pathlib import Path
+        dbg = Path(args.debug_dir)
+        dbg.mkdir(parents=True, exist_ok=True)
+        dbg_log = open(dbg / "decode_log.txt", "w", encoding="utf-8")
+        print(f"[debug] dumping per-marker decode info → {dbg}")
 
     yolo = YOLO(args.model)
     recognizer = DigitRecognizerTri()
@@ -162,8 +181,23 @@ def main() -> int:
                 square = warp_square(enhanced, pts, size=200)
                 if square.size == 0:
                     continue
-                marker_id, _conf = recognizer.recognize(square)
-                corner, _ = find_triangle_corner(square)
+                if dbg is not None:
+                    marker_id, _conf, info = recognizer.read_debug(square)
+                    corner = info["corner"]
+                    if dbg_n < 80:
+                        cv2.imwrite(str(dbg / f"m{dbg_n:03d}_orient.png"), info.get("_oriented", square))
+                        if "_top" in info:
+                            cv2.imwrite(str(dbg / f"m{dbg_n:03d}_top.png"), info["_top"])
+                            cv2.imwrite(str(dbg / f"m{dbg_n:03d}_bot.png"), info["_bot"])
+                        dbg_log.write(
+                            f"m{dbg_n:03d} orient_ok={info['orient_ok']} conf={info['orient_conf']:.2f} "
+                            f"top='{info['top']}'({info['top_conf']:.2f}) "
+                            f"bot='{info['bot']}'({info['bot_conf']:.2f}) id={marker_id}\n")
+                        dbg_log.flush()
+                        dbg_n += 1
+                else:
+                    marker_id, _conf = recognizer.recognize(square)
+                    corner, _ = find_triangle_corner(square)
                 center = pts.mean(axis=0)
                 if marker_id >= 0:
                     n_ok += 1
@@ -189,6 +223,8 @@ def main() -> int:
 
     cap.release()
     cv2.destroyAllWindows()
+    if dbg_log is not None:
+        dbg_log.close()
     return 0
 
 
