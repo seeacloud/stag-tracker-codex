@@ -79,6 +79,25 @@ python -m vision_fusion.generate_stag --ids 64 7 12 0 33 --output .\stag_markers
 python -m vision_fusion.stag_generator_ui
 ```
 
+### 切角数字 Marker 生成器 (digit_marker_tri)
+
+左上切角定向 + 2×2 大数字 + 加权 mod 11(X 兜底)校验。CLI 批量导出：
+
+```powershell
+# 导出 5–25 号到指定目录（闭区间，目录自动建）
+python -m vision_fusion.digit_marker_tri --range 5 25 --output out\markers_5_25\
+python -m vision_fusion.digit_marker_tri --id 83 --output digit_markers_tri\
+```
+
+实时调参（字体 / 字号 / 列距 / 行距 / 粗细 stroke / padding / 切角大小）+ 区间导出 GUI：
+
+```powershell
+python -m vision_fusion.digit_marker_tri_ui
+```
+
+校验位 = `(1·d₁ + 2·d₂ + 3·d₃) mod 11`，值为 10 时印 `X`（ISBN-10 风格），1000 个 ID 全可用。
+左上切角是方向基准（外轮廓五边形，抗模糊），换位/翻转误读由校验位兜底。
+
 ### 屏幕坐标校准
 
 先校准屏幕区域：
