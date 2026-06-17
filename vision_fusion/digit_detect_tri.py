@@ -22,22 +22,22 @@ _ROT_TO_TL = {
 }
 
 
-def find_triangle_corner(square: np.ndarray, b_ratio: float = 0.07,
-                         k_ratio: float = 0.12) -> tuple[int, float]:
-    """4 个内角缝隙各取贴角小块，积分暗度最大者=黑三角所在角。
+def find_triangle_corner(square: np.ndarray, k_ratio: float = 0.26) -> tuple[int, float]:
+    """4 个角各取贴角方块(含黑边框角)，相对最暗者=黑三角所在角。
 
-    返回 (corner, conf)。conf=(最暗-次暗)/(最暗) 作相对 margin。
-    积分暗度天然低通，模糊不改变哪个角更黑（形状糊掉也无妨）。
+    边框 4 角相等→当常数基线；三角只加在其所在角→该角相对最暗。patch 贴角(offset=0)
+    且够大罩住整块三角，远离中央数字，排除数字笔画干扰(干净图实测三角角暗度≈其它 2.2×)。
+    返回 (corner, conf)，conf=(最暗-次暗)/最暗 仅参考；不设阈值，朝向对错最终由 decode_id
+    加权 mod11 校验兜底。
     """
     gray = cv2.cvtColor(square, cv2.COLOR_BGR2GRAY) if square.ndim == 3 else square
     s = gray.shape[0]
-    b = int(s * b_ratio)
     k = max(4, int(s * k_ratio))
     patches = [
-        gray[b:b + k, b:b + k],                  # TL
-        gray[b:b + k, s - b - k:s - b],          # TR
-        gray[s - b - k:s - b, s - b - k:s - b],  # BR
-        gray[s - b - k:s - b, b:b + k],          # BL
+        gray[0:k, 0:k],            # TL
+        gray[0:k, s - k:s],        # TR
+        gray[s - k:s, s - k:s],    # BR
+        gray[s - k:s, 0:k],        # BL
     ]
     dark = [float((255.0 - p.astype(np.float32)).mean()) for p in patches]
     order = sorted(range(4), key=lambda i: dark[i], reverse=True)
@@ -46,12 +46,16 @@ def find_triangle_corner(square: np.ndarray, b_ratio: float = 0.07,
     return order[0], conf
 
 
-def orient_by_triangle(square: np.ndarray,
-                       min_conf: float = 0.15) -> tuple[np.ndarray, bool]:
-    """把黑三角旋到左上。margin 不足 → 返回原图 + False（定向存疑）。"""
-    corner, conf = find_triangle_corner(square)
-    if conf < min_conf:
-        return square, False
+def orient_by_triangle(square: np.ndarray) -> tuple[np.ndarray, bool]:
+    """把(相对)最暗角的黑三角旋到左上。
+
+    IR 画面整体偏灰、无绝对黑白，所以只做 4 角的**相对**比较，相对最暗者=三角所在，
+    **不设绝对/置信度阈值**（之前的 margin 门槛在灰图上会误杀正确朝向，真机实测
+    8 个里 5 个被这个门槛扔掉）。朝向是否正确最终由 decode_id 的加权 mod11 校验兜底
+    ——错朝向读出的串过不了校验返回 -1，不会输出错 ID。返回的 bool 恒为 True（保留
+    签名兼容）。
+    """
+    corner, _ = find_triangle_corner(square)
     rot = _ROT_TO_TL[corner]
     return (square if rot is None else cv2.rotate(square, rot)), True
 
