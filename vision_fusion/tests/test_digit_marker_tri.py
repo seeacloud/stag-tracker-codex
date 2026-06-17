@@ -63,3 +63,40 @@ def test_stroke_ratio_adds_ink():
     base = generate_marker_tri(888, pixels=400, stroke_ratio=0.0)
     bold = generate_marker_tri(888, pixels=400, stroke_ratio=0.08)
     assert int((bold < 128).sum()) >= int((base < 128).sum())
+
+
+import argparse
+
+from vision_fusion.digit_marker_tri import _ids_from_args, main
+
+
+def test_ids_from_args_single():
+    ns = argparse.Namespace(id=83, range=None)
+    assert _ids_from_args(ns) == [83]
+
+
+def test_ids_from_args_inclusive_range():
+    ns = argparse.Namespace(id=None, range=[5, 25])
+    ids = _ids_from_args(ns)
+    assert ids == list(range(5, 26))
+    assert len(ids) == 21  # 闭区间
+
+
+def test_ids_from_args_default_is_0_99():
+    ns = argparse.Namespace(id=None, range=None)
+    assert _ids_from_args(ns) == list(range(0, 100))
+
+
+def test_main_batch_exports_range(tmp_path, monkeypatch):
+    out = tmp_path / "markers_5_25"
+    monkeypatch.setattr(
+        "sys.argv",
+        ["digit_marker_tri", "--range", "5", "25", "--output", str(out),
+         "--pixels", "120"],
+    )
+    rc = main()
+    assert rc == 0
+    pngs = sorted(out.glob("*.png"))
+    assert len(pngs) == 21
+    # 文件名带校验位：5 → 005 + checksum
+    assert (out / f"digit_005_{checksum_char(5)}.png").exists()

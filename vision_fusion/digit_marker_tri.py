@@ -73,3 +73,54 @@ def generate_marker_tri(
 
     return np.array(img)
 
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Generate chamfer-oriented 2x2 digit markers (weighted mod-11 checksum).")
+    parser.add_argument("--id", type=int, default=None, help="Single marker ID (0-999).")
+    parser.add_argument("--range", nargs=2, type=int, default=None,
+                        metavar=("START", "END"), help="Inclusive ID range to batch-export.")
+    parser.add_argument("--output", type=str, default="digit_markers_tri",
+                        help="Output directory (created if missing).")
+    parser.add_argument("--pixels", type=int, default=600)
+    parser.add_argument("--border-ratio", type=float, default=0.07)
+    parser.add_argument("--chamfer-ratio", type=float, default=0.18)
+    parser.add_argument("--pad-ratio", type=float, default=0.06)
+    parser.add_argument("--col-gap-ratio", type=float, default=0.34)
+    parser.add_argument("--row-gap-ratio", type=float, default=0.34)
+    parser.add_argument("--font-path", type=str, default=DEFAULT_FONT)
+    parser.add_argument("--font-size-ratio", type=float, default=0.28)
+    parser.add_argument("--stroke-ratio", type=float, default=0.0)
+    return parser.parse_args()
+
+
+def _ids_from_args(args: argparse.Namespace) -> list[int]:
+    if args.id is not None:
+        return [args.id]
+    if args.range is not None:
+        return list(range(args.range[0], args.range[1] + 1))
+    return list(range(0, 100))
+
+
+def main() -> int:
+    args = parse_args()
+    out = Path(args.output)
+    out.mkdir(parents=True, exist_ok=True)
+    ids = _ids_from_args(args)
+    for mid in ids:
+        arr = generate_marker_tri(
+            mid, pixels=args.pixels, border_ratio=args.border_ratio,
+            chamfer_ratio=args.chamfer_ratio, pad_ratio=args.pad_ratio,
+            col_gap_ratio=args.col_gap_ratio, row_gap_ratio=args.row_gap_ratio,
+            font_path=args.font_path, font_size_ratio=args.font_size_ratio,
+            stroke_ratio=args.stroke_ratio,
+        )
+        Image.fromarray(arr).save(str(out / f"digit_{mid:03d}_{checksum_char(mid)}.png"))
+    print(f"Generated {len(ids)} markers in {out}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
+
