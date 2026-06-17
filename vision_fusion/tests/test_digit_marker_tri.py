@@ -36,14 +36,17 @@ def test_generate_shape_and_dtype():
     assert arr.dtype == np.uint8
 
 
-def test_generate_chamfer_only_top_left():
+def test_generate_black_triangle_inner_top_left():
     p = 600
     arr = generate_marker_tri(83, pixels=p, border_ratio=0.07, chamfer_ratio=0.18)
     b = int(p * 0.07)
-    q = b // 2  # 落在边框带内、且在切角三角内(2q < chamfer)
-    assert arr[q, q] == 255            # 左上被切掉 → 白
-    assert arr[q, p - 1 - q] == 0      # 右上黑框完好 → 黑
-    assert arr[p - 1 - q, q] == 0      # 左下黑框完好 → 黑
+    cut = int(p * 0.18)
+    d = int(cut * 0.25)  # 落在内角三角内的探点
+    # 内框左上角有黑三角 → 黑
+    assert arr[b + d, b + d] == 0
+    # 内框另外两个角(右上、左下)对应位置无三角 → 白
+    assert arr[b + d, p - 1 - b - d] == 255
+    assert arr[p - 1 - b - d, b + d] == 255
 
 
 def test_generate_digits_have_ink_near_cells():

@@ -43,7 +43,8 @@ def generate_marker_tri(
     draw.rectangle([0, 0, p - 1, p - 1], fill=0)              # 全黑
     draw.rectangle([b, b, p - 1 - b, p - 1 - b], fill=255)    # 挖白内部 → 黑边框
     cut = int(p * chamfer_ratio)
-    draw.polygon([(0, 0), (cut, 0), (0, cut)], fill=255)      # 左上切角
+    # 左上内角黑三角（定向标记）：内框左上角填黑，使白窗口左上成 45° 黑切角。
+    draw.polygon([(b, b), (b + cut, b), (b, b + cut)], fill=0)
 
     pad = int(p * pad_ratio)
     lo, hi = b + pad, p - 1 - b - pad

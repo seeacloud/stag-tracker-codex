@@ -42,7 +42,7 @@ class DigitMarkerTriUI:
     SLIDERS = [
         ("字体大小", "font_size_ratio", 0.10, 0.45, 0.28),
         ("边框粗细", "border_ratio", 0.03, 0.15, 0.07),
-        ("切角大小", "chamfer_ratio", 0.05, 0.35, 0.18),
+        ("三角大小", "chamfer_ratio", 0.05, 0.35, 0.18),
         ("四周padding", "pad_ratio", 0.0, 0.20, 0.06),
         ("列距", "col_gap_ratio", 0.15, 0.55, 0.34),
         ("行距", "row_gap_ratio", 0.15, 0.55, 0.34),
