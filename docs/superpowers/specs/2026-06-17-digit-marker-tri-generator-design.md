@@ -74,19 +74,20 @@ def checksum_char(marker_id: int) -> str:
 ## 5. 几何与参数
 
 ```
-┌╱────────────┐   outer 黑框，左上角切掉三角(chamfer)
-│   d₁     d₂  │
-│              │   ← 行距 row_gap（两行心间距）
-│   d₃     检  │     列距 col_gap（两列心间距）
-└──────────────┘   黑框 border_ratio；数字块四周 pad_ratio
+┌─────────────┐   outer 黑框完整方形(四个外角不动)
+│ ◣ d₁    d₂  │   ← 左上内角填黑三角(定向)；白窗左上成五边形
+│             │   ← 行距 row_gap（两行心间距）
+│   d₃    检  │     列距 col_gap（两列心间距）
+└─────────────┘   黑框 border_ratio；数字块四周 pad_ratio
 ```
 
 绘制步骤（PIL，灰度 `L`，背景 255）：
 
 1. 画满黑 `[0,0,p-1,p-1]` → 挖白内部 `[b,b,p-1-b,p-1-b]`（`b=border_ratio·p`），
    形成黑边框 ring。
-2. 切角：左上画白三角 polygon `[(0,0),(ch,0),(0,ch)]`（`ch=chamfer_ratio·p`），
-   切掉外角 → 黑区轮廓成五边形（唯一开口在左上）。
+2. 定向黑三角：在内框左上角画黑三角 polygon `[(b,b),(b+cut,b),(b,b+cut)]`
+   （`cut=chamfer_ratio·p`），填黑 → 白窗口左上角被切成 45°（白区轮廓成五边形，
+   唯一缺角在左上）。外框保持完整方形。
 3. content box = 内框四周再缩 `pad_ratio·p`。
 4. 2×2 格心：以 content box 中心为基准，列心相距 `col_gap_ratio·p`、行心相距
    `row_gap_ratio·p`（四心在中心 ±gap/2）。
