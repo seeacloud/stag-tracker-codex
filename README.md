@@ -98,6 +98,20 @@ python -m vision_fusion.digit_marker_tri_ui
 校验位 = `(1·d₁ + 2·d₂ + 3·d₃) mod 11`，值为 10 时印 `X`（ISBN-10 风格），1000 个 ID 全可用。
 左上内角黑三角是方向基准（外框完整方形，仅内部白窗左上被黑三角切角），换位/翻转误读由校验位兜底。
 
+### 切角数字 Marker 解码器 (digit_detect_tri)
+
+实时识别 tri marker：YOLO-OBB 定位 + 内角暗度三角定向（抗模糊）+ RapidOCR 读数 +
+加权 mod11+X 校验。
+
+```powershell
+python -m vision_fusion.digit_detect_tri --source 0
+```
+
+绿框 + 三位 ID + 方向箭头；定向或校验存疑显示黄 `?`。`Esc` 退。默认模型
+`models\tri_marker_obb.pt`（专为 tri marker 训练，旧 `digi_marker_obb.pt` 对 tri 漏检严重）。
+合成 tri 检测训练数据：`python -m vision_fusion.gen_tri_yolo --count 800 --output datasets\tri_det`
+（marker 永不重叠，直接用 `digit_markers_tri` 导出的 PNG）。
+
 ### 屏幕坐标校准
 
 先校准屏幕区域：
