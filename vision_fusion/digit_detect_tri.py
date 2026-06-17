@@ -54,3 +54,18 @@ def orient_by_triangle(square: np.ndarray,
         return square, False
     rot = _ROT_TO_TL[corner]
     return (square if rot is None else cv2.rotate(square, rot)), True
+
+
+def decode_id(chars: str) -> int:
+    """OCR 字符串 → marker_id。保留 0-9 与 X，取前 4 位，加权 mod11 校验。
+
+    前 3 位须为数字、第 4 位为校验(0-9 或 X)；校验不过或非法返回 -1。
+    """
+    keep = "".join(c for c in chars if c in "0123456789X")
+    if len(keep) < 4:
+        return -1
+    s = keep[:4]
+    if not s[:3].isdigit():        # 数据位出现 X 等 → 非法
+        return -1
+    mid = int(s[:3])
+    return mid if checksum_char(mid) == s[3] else -1

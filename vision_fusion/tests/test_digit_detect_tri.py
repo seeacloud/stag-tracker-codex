@@ -43,3 +43,28 @@ def test_find_triangle_corner_survives_blur():
     for rot, expected in CASES:
         img = gen if rot is None else cv2.rotate(gen, rot)
         assert find_triangle_corner(_degrade(img))[0] == expected
+
+
+from vision_fusion.digit_detect_tri import decode_id
+
+
+def test_decode_id_valid():
+    assert decode_id("0204") == 20    # 020 校验 4
+    assert decode_id("0833") == 83    # 083 校验 3
+    assert decode_id("007X") == 7     # 007 校验 X(=10)
+
+
+def test_decode_id_strips_noise():
+    assert decode_id("0 2 0 4") == 20      # 空格被过滤
+    assert decode_id("[0204]") == 20       # 括号等杂字符被过滤(只留 0-9/X)
+    assert decode_id("0833\n") == 83
+
+
+def test_decode_id_rejects_bad_checksum():
+    assert decode_id("0205") == -1
+
+
+def test_decode_id_rejects_short_or_x_in_data():
+    assert decode_id("007") == -1     # 不足 4 位
+    assert decode_id("0X34") == -1    # 前 3 位出现 X（数据位不该有 X）
+
