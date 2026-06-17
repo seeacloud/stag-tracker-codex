@@ -48,6 +48,13 @@
 rec-only → 保留 X 取 4 字符 → 加权 mod11+X 校验 → 叠加 ID/方向（可选 MarkerTracker
 投票）。
 
+> **YOLO 模型注意**：`digi_marker_obb.pt` 是用**旧 marker**（圆点/缺口设计）训练的，
+> 与当前 tri（内角黑三角）**不是同一种**。YOLO-OBB 主抓"黑方框 + 2×2 数字"这个大
+> 特征，角上小三角对它影响小，**可能**直接泛化（实拍照片里框得尚可），但这是未验证
+> 假设。本 plan 把"在 tri marker 上验证现有模型的检出率"列为显式步骤；若检出不足，
+> **另起子项目**合成 tri 训练数据重训 OBB（复用 `generate_marker_tri` + `gen_notch_yolo.py`
+> 的数据合成/标注套路 → `models/tri_marker_obb.pt`），`--model` 可切换，解码逻辑不变。
+
 ## 4. 三角定向（内角暗度）
 
 `find_triangle_corner(square) -> (corner:int, conf:float)`：
@@ -112,8 +119,12 @@ warp 后 marker 充满 SxS，外圈黑边框厚 `b≈border_ratio*S`，黑三角
 
 ## 8. 范围边界（YAGNI）
 
-不做：重训 YOLO（复用 `digi_marker_obb.pt`）；不碰 `digit_detect.py`/`digit_detect3.py`/
-其他解码器；不发 TUIO（要的话另起任务）；不做屏幕映射/坐标归一化。解码端只管
-定位 + 三角定向 + 读 ID + 加权校验 + 叠加显示。
+本 plan 只做：定位（先复用现有 OBB）+ 三角定向 + 读 ID + 加权校验 + 叠加显示，并
+**验证现有 OBB 在 tri marker 上的检出率**。
+
+不做（留作后续/另起）：
+- **重训 OBB**：仅当上面的验证显示现有 `digi_marker_obb.pt` 检出不足时才触发，届时
+  另起独立 spec/plan（合成 tri 数据 + 训练 + 评估），不混进本 plan。
+- 不碰 `digit_detect.py`/`digit_detect3.py`/其他解码器；不发 TUIO；不做屏幕映射/坐标归一化。
 
 
