@@ -22,27 +22,46 @@ _ROT_TO_TL = {
 }
 
 
-def find_triangle_corner(square: np.ndarray, k_ratio: float = 0.26) -> tuple[int, float]:
-    """4 个角各取贴角方块(含黑边框角)，相对最暗者=黑三角所在角。
+_TRI_L = 0.30  # 角三角取样区的腿长占比(罩住 marker 的黑三角，排除中央数字)
 
-    边框 4 角相等→当常数基线；三角只加在其所在角→该角相对最暗。patch 贴角(offset=0)
-    且够大罩住整块三角，远离中央数字，排除数字笔画干扰(干净图实测三角角暗度≈其它 2.2×)。
-    返回 (corner, conf)，conf=(最暗-次暗)/最暗 仅参考；不设阈值，朝向对错最终由 decode_id
-    加权 mod11 校验兜底。
-    """
-    gray = cv2.cvtColor(square, cv2.COLOR_BGR2GRAY) if square.ndim == 3 else square
+
+def _corner_triangle_darkness(gray: np.ndarray) -> list[float]:
+    """4 个角各取一块直角三角区(贴角、斜边朝中心，正好罩黑三角该在的楔形)，
+    返回各自的平均暗度 (255-灰度)。三角区比方块更聚焦三角、少蹭数字/背景。"""
     s = gray.shape[0]
-    k = max(4, int(s * k_ratio))
-    patches = [
-        gray[0:k, 0:k],            # TL
-        gray[0:k, s - k:s],        # TR
-        gray[s - k:s, s - k:s],    # BR
-        gray[s - k:s, 0:k],        # BL
+    L = max(6, int(s * _TRI_L))
+    tris = [
+        [(0, 0), (L, 0), (0, L)],              # TL
+        [(s, 0), (s - L, 0), (s, L)],          # TR
+        [(s, s), (s - L, s), (s, s - L)],      # BR
+        [(0, s), (L, s), (0, s - L)],          # BL
     ]
-    dark = [float((255.0 - p.astype(np.float32)).mean()) for p in patches]
+    inv = 255.0 - gray.astype(np.float32)
+    out = []
+    for t in tris:
+        m = np.zeros((s, s), np.uint8)
+        cv2.fillConvexPoly(m, np.array(t, np.int32), 1)
+        out.append(float(inv[m == 1].mean()))
+    return out
+
+
+def corner_ranking(square: np.ndarray) -> tuple[list[int], list[float]]:
+    """按三角区暗度从大到小给 4 个角排序，返回 (排序后的角下标, 各角暗度)。"""
+    gray = cv2.cvtColor(square, cv2.COLOR_BGR2GRAY) if square.ndim == 3 else square
+    dark = _corner_triangle_darkness(gray)
     order = sorted(range(4), key=lambda i: dark[i], reverse=True)
-    top, second = dark[order[0]], dark[order[1]]
-    conf = (top - second) / (top + 1e-6)
+    return order, dark
+
+
+def find_triangle_corner(square: np.ndarray) -> tuple[int, float]:
+    """相对最暗(三角区)的角=黑三角所在。返回 (corner, conf)。
+
+    用三角形取样而非方块：贴角直角三角区正好罩三角该在的楔形，排除中央数字笔画与
+    背景，真实 IR 上区分度更高。conf=(最暗-次暗)/最暗 仅参考；最终朝向由 recognize
+    的"暗度排序+逐朝向校验"确定，单角选错也会被加权 mod11 校验纠回。
+    """
+    order, dark = corner_ranking(square)
+    conf = (dark[order[0]] - dark[order[1]]) / (dark[order[0]] + 1e-6)
     return order[0], conf
 
 
@@ -93,29 +112,44 @@ class DigitRecognizerTri:
         conf = float(np.mean([r[1] for r in result]))
         return text, conf
 
-    def read_debug(self, square: np.ndarray) -> tuple[int, float, dict]:
-        """识别并返回中间量（定向/两行 OCR 原文）供调试。"""
-        corner, oconf = find_triangle_corner(square)
-        oriented, ok = orient_by_triangle(square)
-        info = {"orient_ok": ok, "orient_conf": oconf, "corner": corner,
-                "top": "", "bot": "", "top_conf": 0.0, "bot_conf": 0.0}
-        if not ok:
-            return -1, 0.0, info
-        h, w = oriented.shape[:2]
+    def _read_oriented(self, square: np.ndarray, corner: int):
+        """按指定角旋正 → 上下对半裁 → 各行 OCR。返回中间量。"""
+        rot = _ROT_TO_TL[corner]
+        o = square if rot is None else cv2.rotate(square, rot)
+        h, w = o.shape[:2]
         x0, x1 = int(w * 0.12), int(w * 0.88)
-        top = cv2.resize(oriented[int(h * 0.12):int(h * 0.50), x0:x1], None,
-                         fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
-        bot = cv2.resize(oriented[int(h * 0.50):int(h * 0.88), x0:x1], None,
-                         fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
-        t_txt, t_c = self._ocr(top)
-        b_txt, b_c = self._ocr(bot)
-        info.update(top=t_txt, bot=b_txt, top_conf=t_c, bot_conf=b_c,
-                    _oriented=oriented, _top=top, _bot=bot)
-        if not (t_txt and b_txt):
-            return -1, 0.0, info
-        conf = (t_c + b_c) / 2.0
-        mid = decode_id(t_txt + b_txt)
-        return (mid if mid >= 0 else -1), conf, info
+        top = cv2.resize(o[int(h * 0.12):int(h * 0.50), x0:x1], None, fx=3, fy=3,
+                         interpolation=cv2.INTER_CUBIC)
+        bot = cv2.resize(o[int(h * 0.50):int(h * 0.88), x0:x1], None, fx=3, fy=3,
+                         interpolation=cv2.INTER_CUBIC)
+        tt, tc = self._ocr(top)
+        bt, bc = self._ocr(bot)
+        return tt, tc, bt, bc, o, top, bot
+
+    def read_debug(self, square: np.ndarray) -> tuple[int, float, dict]:
+        """暗度排序 + 逐朝向试 + 第一个过加权 mod11 校验的即采纳。
+
+        三角暗度给朝向先验(最可能的先试)，校验位确认；单角排错也会被校验纠回
+        (落到排序里下一个)，且按序取首个有效解，避免旋转碰撞误接受。
+        """
+        order, dark = corner_ranking(square)
+        info = {"ranking": order, "corner": order[0], "orient_ok": True,
+                "orient_conf": (dark[order[0]] - dark[order[1]]) / (dark[order[0]] + 1e-6),
+                "top": "", "bot": "", "top_conf": 0.0, "bot_conf": 0.0}
+        first = None
+        for corner in order:
+            tt, tc, bt, bc, o, top, bot = self._read_oriented(square, corner)
+            if first is None:
+                first = (corner, tt, tc, bt, bc, o, top, bot)
+            mid = decode_id(tt + bt) if (tt and bt) else -1
+            if mid >= 0:
+                info.update(corner=corner, top=tt, bot=bt, top_conf=tc, bot_conf=bc,
+                            _oriented=o, _top=top, _bot=bot)
+                return mid, (tc + bc) / 2.0, info
+        c, tt, tc, bt, bc, o, top, bot = first
+        info.update(corner=c, top=tt, bot=bt, top_conf=tc, bot_conf=bc,
+                    _oriented=o, _top=top, _bot=bot)
+        return -1, 0.0, info
 
     def recognize(self, square: np.ndarray, min_conf: float = 0.5) -> tuple[int, float]:
         mid, conf, _ = self.read_debug(square)
@@ -185,23 +219,18 @@ def main() -> int:
                 square = warp_square(enhanced, pts, size=200)
                 if square.size == 0:
                     continue
-                if dbg is not None:
-                    marker_id, _conf, info = recognizer.read_debug(square)
-                    corner = info["corner"]
-                    if dbg_n < 80:
-                        cv2.imwrite(str(dbg / f"m{dbg_n:03d}_orient.png"), info.get("_oriented", square))
-                        if "_top" in info:
-                            cv2.imwrite(str(dbg / f"m{dbg_n:03d}_top.png"), info["_top"])
-                            cv2.imwrite(str(dbg / f"m{dbg_n:03d}_bot.png"), info["_bot"])
-                        dbg_log.write(
-                            f"m{dbg_n:03d} orient_ok={info['orient_ok']} conf={info['orient_conf']:.2f} "
-                            f"top='{info['top']}'({info['top_conf']:.2f}) "
-                            f"bot='{info['bot']}'({info['bot_conf']:.2f}) id={marker_id}\n")
-                        dbg_log.flush()
-                        dbg_n += 1
-                else:
-                    marker_id, _conf = recognizer.recognize(square)
-                    corner, _ = find_triangle_corner(square)
+                marker_id, _conf, info = recognizer.read_debug(square)
+                corner = info["corner"]            # 校验通过时采纳的朝向角
+                if dbg is not None and dbg_n < 80:
+                    cv2.imwrite(str(dbg / f"m{dbg_n:03d}_orient.png"), info.get("_oriented", square))
+                    if "_top" in info:
+                        cv2.imwrite(str(dbg / f"m{dbg_n:03d}_top.png"), info["_top"])
+                        cv2.imwrite(str(dbg / f"m{dbg_n:03d}_bot.png"), info["_bot"])
+                    dbg_log.write(
+                        f"m{dbg_n:03d} ranking={info['ranking']} chosen={corner} "
+                        f"top='{info['top']}' bot='{info['bot']}' id={marker_id}\n")
+                    dbg_log.flush()
+                    dbg_n += 1
                 center = pts.mean(axis=0)
                 if marker_id >= 0:
                     n_ok += 1
