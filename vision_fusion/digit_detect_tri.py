@@ -255,7 +255,8 @@ class DigitClassifierTri:
     按角暗度排序逐朝向试，首个过 decode_id 校验的采纳。全 4 朝向也才 16 次微推理。
     """
 
-    def __init__(self, model_path: str = "models/tri_digit_cnn.pt"):
+    def __init__(self, model_path: str = "models/tri_digit_cnn.pt",
+                 min_cell_conf: float = 0.6, max_orient: int = 2):
         import torch
         from .nn_train_digit import DigitCNN
         self.torch = torch
@@ -263,20 +264,26 @@ class DigitClassifierTri:
         self.model = DigitCNN(num_classes=len(CHARS)).to(self.device)
         self.model.load_state_dict(torch.load(model_path, map_location=self.device))
         self.model.eval()
+        # 接受一个读数需:① 过加权 mod11 校验 ② 4 格里**最低**置信度 ≥ min_cell_conf
+        # (淡 marker 误读常有某格 0.4~0.6 在瞎猜,挡掉避免凑巧撞合法编号的假阳性)。
+        self.min_cell_conf = min_cell_conf
+        # 只试暗度排序前 max_orient 个朝向(去梯度后暗度可靠),杜绝"末位朝向凑合法编号"。
+        self.max_orient = max_orient
 
-    def _classify(self, cells: list) -> tuple[str, float]:
-        """4 格 → (4 字符串, 平均置信度)。一次 batch 推理。"""
+    def _classify(self, cells: list) -> tuple[str, float, float]:
+        """4 格 → (4 字符串, 平均置信度, 最低单格置信度)。一次 batch 推理。"""
         batch = np.stack([c.astype(np.float32) / 255.0 for c in cells])[:, None]
         x = self.torch.from_numpy(batch).to(self.device)
         with self.torch.no_grad():
             prob = self.torch.softmax(self.model(x), dim=1)
             conf, idx = prob.max(dim=1)
         chars = "".join(CHARS[i] for i in idx.tolist())
-        return chars, float(conf.mean().item())
+        cc = conf.tolist()
+        return chars, float(sum(cc) / 4.0), float(min(cc))
 
     def _classify_many(self, groups: list) -> list:
-        """groups: list[4 格]。把所有组的格子拼成一个大 batch 跑**一次** CNN,
-        返回每组 (chars, conf)。消除多 marker×多朝向逐次调用的 GPU 同步开销。"""
+        """groups: list[4 格]。所有组的格子拼成一个大 batch 跑**一次** CNN,
+        返回每组 (chars, mean_conf, min_conf)。消除多 marker×多朝向逐次调用的 GPU 同步开销。"""
         if not groups:
             return []
         flat = np.stack([c for g in groups for c in g]).astype(np.float32) / 255.0
@@ -288,27 +295,27 @@ class DigitClassifierTri:
         out = []
         for k in range(len(groups)):
             ii = idx[k * 4:(k + 1) * 4]; cc = conf[k * 4:(k + 1) * 4]
-            out.append(("".join(CHARS[j] for j in ii), sum(cc) / 4.0))
+            out.append(("".join(CHARS[j] for j in ii), sum(cc) / 4.0, min(cc)))
         return out
 
     def read_batch(self, squares: list) -> list:
-        """对多个 square 一次性解码:所有 square×4 朝向的格子拼成单次 CNN 前向,
-        再按各自暗度排序挑首个过校验的。返回 list[(id, conf, info)],与 read_debug 同格式。"""
+        """对多个 square 一次性解码:所有 square×前 max_orient 朝向的格子拼成单次 CNN 前向,
+        挑首个**过校验且 4 格最低置信度达标**的。返回 list[(id, conf, info)],与 read_debug 同格式。"""
         groups = []          # 每个 = 一组 4 格
         owner = []           # (square_idx, corner)
         rankings = []
         for si, sq in enumerate(squares):
             order, dark = corner_ranking(sq)
             rankings.append((order, dark))
-            for corner in order:
+            for corner in order[:self.max_orient]:     # 只试暗度前 N 个朝向
                 rot = _ROT_TO_TL[corner]
                 o = sq if rot is None else cv2.rotate(sq, rot)
                 groups.append(slice_cells(o))
                 owner.append((si, corner))
         preds = self._classify_many(groups)        # 一次前向
         per_sq = {}
-        for (si, corner), (chars, conf) in zip(owner, preds):
-            per_sq.setdefault(si, []).append((corner, chars, conf))
+        for (si, corner), (chars, conf, mn) in zip(owner, preds):
+            per_sq.setdefault(si, []).append((corner, chars, conf, mn))
         results = []
         for si in range(len(squares)):
             order, dark = rankings[si]
@@ -318,15 +325,15 @@ class DigitClassifierTri:
             cands = per_sq[si]                      # 已按 order 顺序
             first = cands[0]
             chosen = None
-            for corner, chars, conf in cands:
-                if decode_id(chars) >= 0:
+            for corner, chars, conf, mn in cands:
+                if decode_id(chars) >= 0 and mn >= self.min_cell_conf:   # 校验 + 置信度门槛
                     chosen = (decode_id(chars), conf, corner, chars); break
             if chosen is not None:
                 mid, conf, corner, chars = chosen
                 info.update(corner=corner, top=chars[:2], bot=chars[2:], top_conf=conf, bot_conf=conf)
                 results.append((mid, conf, info))
             else:
-                corner, chars, conf = first
+                corner, chars, conf, mn = first
                 info.update(corner=corner, top=chars[:2], bot=chars[2:], top_conf=conf, bot_conf=conf)
                 results.append((-1, 0.0, info))
         return results
@@ -337,13 +344,13 @@ class DigitClassifierTri:
                 "orient_conf": (dark[order[0]] - dark[order[1]]) / (dark[order[0]] + 1e-6),
                 "top": "", "bot": "", "top_conf": 0.0, "bot_conf": 0.0}
         first = None
-        for corner in order:
+        for corner in order[:self.max_orient]:
             rot = _ROT_TO_TL[corner]
             o = square if rot is None else cv2.rotate(square, rot)
-            chars, conf = self._classify(slice_cells(o))
+            chars, conf, mn = self._classify(slice_cells(o))
             if first is None:
                 first = (corner, chars, conf, o)
-            if decode_id(chars) >= 0:
+            if decode_id(chars) >= 0 and mn >= self.min_cell_conf:
                 info.update(corner=corner, top=chars[:2], bot=chars[2:],
                             top_conf=conf, bot_conf=conf, _oriented=o)
                 return decode_id(chars), conf, info
