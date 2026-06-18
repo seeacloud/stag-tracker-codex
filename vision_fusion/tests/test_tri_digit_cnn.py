@@ -153,3 +153,15 @@ def test_corner_ranking_survives_illumination_gradient():
         r = ramp if rot is None else cv2.rotate(ramp, rot)
         im2 = np.clip(im + (r - 0.5) * 80, 0, 255).astype(np.uint8)   # 叠强梯度
         assert corner_ranking(im2)[0][0] == exp, f"rot {rot} 方向判错"
+
+
+def test_temporal_average_denoises():
+    from vision_fusion.digit_detect_tri import _TemporalAvg
+    base = np.full((200, 200), 128, np.uint8)
+    ta = _TemporalAvg(k=5)
+    rng = np.random.default_rng(0)
+    last = None
+    for _ in range(5):
+        noisy = np.clip(base.astype(np.float32) + rng.normal(0, 25, base.shape), 0, 255).astype(np.uint8)
+        last = ta.push((3, 4), noisy)
+    assert float(last.std()) < 12.0      # 5 帧平均 → 噪声 ~÷√5

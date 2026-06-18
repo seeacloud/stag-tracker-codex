@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import threading
 import time
+from collections import deque
 
 import cv2
 import numpy as np
@@ -369,15 +370,48 @@ class DigitClassifierTri:
         return mid, conf
 
 
-def decode_markers_cached(entries, recognizer, tracker, decay: float = 0.6):
-    """一帧多 marker:**每帧都重新识别**(批处理,便宜),用衰减投票平滑。
+class _TemporalAvg:
+    """按位置 key 缓冲最近 k 帧的 warp 小图,返回其平均(降噪)。
+    位置变了(marker 移动/换位)对应 key 不同 → 自然不跨位置平均、无拖影。"""
+    def __init__(self, k: int = 5):
+        self.k = k
+        self.buf: dict = {}
 
-    不再按位置缓存跳过识别——否则 marker 被换/移动时旧位置会赖着旧 id(位置记忆 bug)。
-    每帧 read_batch 重读所有 marker → 喂 tracker.update(decay) 衰减投票 → query_at 取稳定 id。
-    这样 id 永远跟随"当前帧实际读到的",换 marker 几帧内接管;衰减投票仍消单帧 flicker。
+    def push(self, key, square: np.ndarray) -> np.ndarray:
+        d = self.buf.get(key)
+        if d is None:
+            d = deque(maxlen=self.k)
+            self.buf[key] = d
+        d.append(square.astype(np.float32))
+        return np.mean(d, axis=0).astype(np.uint8)
+
+    def prune(self, live_keys):
+        for k in [k for k in self.buf if k not in live_keys]:
+            del self.buf[k]
+
+
+def decode_markers_cached(entries, recognizer, tracker, decay: float = 0.6):
+    """一帧多 marker:**每帧都重新识别**(批处理,便宜),静止位置多帧平均降噪 + 衰减投票平滑。
+
+    不按位置缓存跳过识别(否则 marker 被换/移动时旧位置赖着旧 id)。流程:
+    按 40px 网格 key 把同一静止位置的 warp 小图叠最近 K 帧求平均(噪声÷√K,淡数字浮出;
+    位置变=key 变→不跨位置平均、无拖影)→ read_batch 重读 → 衰减投票 → query_at 取稳定 id。
     entries: list[(pts, square)]。返回 (items, n_cnn),item={pts,center,corner,id,info}。
     """
-    squares = [sq for _, sq in entries]
+    ta = getattr(tracker, "_tavg", None)
+    if ta is None:
+        ta = _TemporalAvg(k=5)
+        tracker._tavg = ta
+    live = set()
+    proc = []          # (pts, center, 平均后的 square)
+    for pts, square in entries:
+        center = tuple(float(v) for v in pts.mean(axis=0))
+        key = (round(center[0] / 40.0), round(center[1] / 40.0))
+        live.add(key)
+        proc.append((pts, center, ta.push(key, square)))
+    ta.prune(live)
+
+    squares = [sq for _, _, sq in proc]
     if squares and hasattr(recognizer, "read_batch"):
         reads = recognizer.read_batch(squares)
     else:
@@ -385,8 +419,7 @@ def decode_markers_cached(entries, recognizer, tracker, decay: float = 0.6):
     n_cnn = len(squares)
     detections = []
     pend = []
-    for (pts, _sq), (mid, conf, info) in zip(entries, reads):
-        center = tuple(float(v) for v in pts.mean(axis=0))
+    for (pts, center, _sq), (mid, conf, info) in zip(proc, reads):
         detections.append((mid, conf, center))
         pend.append((pts, center, info["corner"], info))
     tracker.update(detections, decay=decay)
