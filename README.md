@@ -111,6 +111,12 @@ python -m vision_fusion.digit_detect_tri --source 0
 耗时。`Esc` 退。默认模型 `models\tri_marker_obb.pt`（专为 tri marker 训练，旧 `digi_marker_obb.pt`
 对 tri 漏检严重）。
 
+**实时性能(实测 8→37 FPS)**:三段独立显示——检出画绿框、定向(暗度)画箭头、解出 id 才显示数字,
+各画各的,失败能定位到具体步骤。提速三件事:① 后台抓帧线程(去相机 read 延迟+缓冲滞后);
+② 解码缓存+多帧投票(静止 marker 认出一次就锁定、跳过 CNN,稳态 decode≈0,顺带消 flicker、
+票数 margin 压假阳性);③ CNN 批处理(一帧所有未锁定 marker 拼一次前向)。带窗口稳态 ~37 FPS。
+`--no-track` 关投票缓存、`--no-thread` 关抓帧线程(调试用,会变慢)。
+
 **识别默认走轻量 CNN（`--recognizer cnn`，模型 `models\tri_digit_cnn.pt`）**：2×2 切 4 格、
 11 类（0-9 与校验 X）分类器，比通用 RapidOCR 快约 100 倍（decode 5591ms→34ms，整链 0.2→20 FPS）
 且更准（只在合法字符里选）。`--recognizer ocr` 切回 RapidOCR 作对照。CNN 模型缺失时自动回退 OCR。
