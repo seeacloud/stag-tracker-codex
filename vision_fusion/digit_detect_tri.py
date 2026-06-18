@@ -7,6 +7,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import time
 
 import cv2
 import numpy as np
@@ -23,6 +24,41 @@ _ROT_TO_TL = {
 
 
 _TRI_L = 0.30  # 角三角取样区的腿长占比(罩住 marker 的黑三角，排除中央数字)
+
+
+CHARS = "0123456789X"            # 11 类：0-9 与校验位 X(=10)
+
+# 切格几何锁定部署 marker 的 GUI 参数(digit_marker_tri_settings.json)。
+# 若重调 marker 列距/行距，这两个值要同步更新并重训分类器。
+TRI_COL_GAP = 0.3765
+TRI_ROW_GAP = 0.4176
+CELL_HALF = 0.21                 # 归一化裁剪半边长(罩住单字、不蹭邻格)
+CELL_OUT = 64                    # 输出格子尺寸(与 DigitCNN 输入一致)
+
+
+def cell_centers(col_gap: float = TRI_COL_GAP, row_gap: float = TRI_ROW_GAP):
+    """4 个数字格中心(归一化)，顺序 [TL d1, TR d2, BL d3, BR check]，
+    与 generate_marker_tri 的 glyph 顺序一致。"""
+    return [(0.5 - col_gap / 2, 0.5 - row_gap / 2),
+            (0.5 + col_gap / 2, 0.5 - row_gap / 2),
+            (0.5 - col_gap / 2, 0.5 + row_gap / 2),
+            (0.5 + col_gap / 2, 0.5 + row_gap / 2)]
+
+
+def slice_cells(square: np.ndarray, half: float = CELL_HALF, out: int = CELL_OUT):
+    """把拉正后的 marker 切成 4 个数字格(灰度 out×out)。训练与推理共用，
+    保证几何一致。square 可为灰度或 BGR。"""
+    gray = cv2.cvtColor(square, cv2.COLOR_BGR2GRAY) if square.ndim == 3 else square
+    s = gray.shape[0]
+    h = int(half * s)
+    cells = []
+    for ncx, ncy in cell_centers():
+        cx, cy = int(ncx * s), int(ncy * s)
+        x0, x1 = max(0, cx - h), min(s, cx + h)
+        y0, y1 = max(0, cy - h), min(s, cy + h)
+        crop = gray[y0:y1, x0:x1]
+        cells.append(cv2.resize(crop, (out, out), interpolation=cv2.INTER_AREA))
+    return cells
 
 
 def _corner_triangle_darkness(gray: np.ndarray) -> list[float]:
@@ -199,18 +235,26 @@ def main() -> int:
     cv2.namedWindow(win, cv2.WINDOW_NORMAL)
     print("Digit Marker TRI decoder. Esc=quit.")
 
+    fps_ema = None          # 指数滑动平均,读数稳一点
     while True:
+        f0 = time.perf_counter()
+        t = time.perf_counter()
         ok, frame = cap.read()
+        t_read = time.perf_counter() - t
         if not ok:
             break
         if args.mirror:
             frame = cv2.flip(frame, 1)
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         enhanced = clahe.apply(gray)
+        t = time.perf_counter()
         results = yolo(cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR), verbose=False, conf=args.conf)
+        t_yolo = time.perf_counter() - t
 
         disp = frame
         n_ok = 0
+        n_mk = 0
+        t = time.perf_counter()
         for r in results:
             if r.obb is None:
                 continue
@@ -219,6 +263,7 @@ def main() -> int:
                 square = warp_square(enhanced, pts, size=200)
                 if square.size == 0:
                     continue
+                n_mk += 1
                 marker_id, _conf, info = recognizer.read_debug(square)
                 corner = info["corner"]            # 校验通过时采纳的朝向角
                 if dbg is not None and dbg_n < 80:
@@ -248,8 +293,17 @@ def main() -> int:
                     draw_corners(disp, pts, color=(0, 180, 180))
                     cv2.putText(disp, "?", (int(center[0]) - 5, int(center[1]) + 5),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 180, 180), 1, cv2.LINE_AA)
+        t_dec = time.perf_counter() - t
 
-        cv2.putText(disp, f"IDs:{n_ok}", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1)
+        t_frame = time.perf_counter() - f0
+        inst_fps = 1.0 / t_frame if t_frame > 0 else 0.0
+        fps_ema = inst_fps if fps_ema is None else 0.9 * fps_ema + 0.1 * inst_fps
+        # 左上角:FPS + 每步 ms(read/yolo/decode),decode 一般是大头。
+        cv2.putText(disp, f"FPS:{fps_ema:4.1f}  IDs:{n_ok}/{n_mk}", (10, 25),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA)
+        cv2.putText(disp,
+                    f"read {t_read*1000:.0f} | yolo {t_yolo*1000:.0f} | decode {t_dec*1000:.0f} ms",
+                    (10, 48), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
         cv2.imshow(win, disp)
         if (cv2.waitKey(1) & 0xFF) == 27:
             break
