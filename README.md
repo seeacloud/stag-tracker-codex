@@ -118,8 +118,9 @@ python -m vision_fusion.digit_detect_tri --source 0
 训练 CNN 识别器（用 GUI 保存的字体/参数渲染 marker，切格自动打标，与推理同源切格）：
 
 ```powershell
-# 1) 生成训练数据(0-9+X 单格 crop, 含退化增广)
-python -m vision_fusion.nn_synth_tri_digit --aug 20 --archive docs\test-screenshots\tri-slice-verify
+# 1) 生成训练数据(0-9+X 单格 crop)。--aug 干净退化派生; --scene 走 overlay+warp 的
+#    采集真实样本(透视+半透明混合+缩放上采样),后者对实拍准确率关键,别省。
+python -m vision_fusion.nn_synth_tri_digit --aug 12 --scene 18 --archive docs\test-screenshots\tri-slice-verify
 # 2) 训练 11 类分类器 → models\tri_digit_cnn.pt
 python -m vision_fusion.nn_train_tri_digit --data datasets\tri_digit_crops --epochs 15
 ```
