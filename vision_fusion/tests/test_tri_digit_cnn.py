@@ -117,3 +117,18 @@ def test_classifier_reads_all_rotations():
         img = g if rot is None else cv2.rotate(g, rot)
         got, _ = rec.recognize(img, min_conf=0.0)
         assert got == mid, f"rot {rot} read as {got}"
+
+
+@pytest.mark.skipif(not _HAS_MODEL, reason="tri_digit_cnn.pt 未训练")
+def test_read_batch_matches_read_debug():
+    """批处理识别必须与逐个识别结果一致(提速不改判)。"""
+    from vision_fusion.digit_detect_tri import DigitClassifierTri
+    samples = _real_markers([0, 7, 20, 83])
+    if not samples:
+        pytest.skip("digit_markers_tri 里无导出 marker")
+    rec = DigitClassifierTri()
+    sqs = [cv2.imread(p, cv2.IMREAD_GRAYSCALE) for _, p in samples]
+    batch = rec.read_batch(sqs)
+    for (mid, p), (bid, _, _) in zip(samples, batch):
+        did, _, _ = rec.read_debug(cv2.imread(p, cv2.IMREAD_GRAYSCALE))
+        assert bid == did == mid, f"{mid}: batch={bid} debug={did}"

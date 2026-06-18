@@ -7,6 +7,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import threading
 import time
 
 import cv2
@@ -247,6 +248,63 @@ class DigitClassifierTri:
         chars = "".join(CHARS[i] for i in idx.tolist())
         return chars, float(conf.mean().item())
 
+    def _classify_many(self, groups: list) -> list:
+        """groups: list[4 格]。把所有组的格子拼成一个大 batch 跑**一次** CNN,
+        返回每组 (chars, conf)。消除多 marker×多朝向逐次调用的 GPU 同步开销。"""
+        if not groups:
+            return []
+        flat = np.stack([c for g in groups for c in g]).astype(np.float32) / 255.0
+        x = self.torch.from_numpy(flat)[:, None].to(self.device)
+        with self.torch.no_grad():
+            prob = self.torch.softmax(self.model(x), dim=1)
+            conf, idx = prob.max(dim=1)
+        idx = idx.tolist(); conf = conf.tolist()
+        out = []
+        for k in range(len(groups)):
+            ii = idx[k * 4:(k + 1) * 4]; cc = conf[k * 4:(k + 1) * 4]
+            out.append(("".join(CHARS[j] for j in ii), sum(cc) / 4.0))
+        return out
+
+    def read_batch(self, squares: list) -> list:
+        """对多个 square 一次性解码:所有 square×4 朝向的格子拼成单次 CNN 前向,
+        再按各自暗度排序挑首个过校验的。返回 list[(id, conf, info)],与 read_debug 同格式。"""
+        groups = []          # 每个 = 一组 4 格
+        owner = []           # (square_idx, corner)
+        rankings = []
+        for si, sq in enumerate(squares):
+            order, dark = corner_ranking(sq)
+            rankings.append((order, dark))
+            for corner in order:
+                rot = _ROT_TO_TL[corner]
+                o = sq if rot is None else cv2.rotate(sq, rot)
+                groups.append(slice_cells(o))
+                owner.append((si, corner))
+        preds = self._classify_many(groups)        # 一次前向
+        per_sq = {}
+        for (si, corner), (chars, conf) in zip(owner, preds):
+            per_sq.setdefault(si, []).append((corner, chars, conf))
+        results = []
+        for si in range(len(squares)):
+            order, dark = rankings[si]
+            info = {"ranking": order, "corner": order[0], "orient_ok": True,
+                    "orient_conf": (dark[order[0]] - dark[order[1]]) / (dark[order[0]] + 1e-6),
+                    "top": "", "bot": "", "top_conf": 0.0, "bot_conf": 0.0}
+            cands = per_sq[si]                      # 已按 order 顺序
+            first = cands[0]
+            chosen = None
+            for corner, chars, conf in cands:
+                if decode_id(chars) >= 0:
+                    chosen = (decode_id(chars), conf, corner, chars); break
+            if chosen is not None:
+                mid, conf, corner, chars = chosen
+                info.update(corner=corner, top=chars[:2], bot=chars[2:], top_conf=conf, bot_conf=conf)
+                results.append((mid, conf, info))
+            else:
+                corner, chars, conf = first
+                info.update(corner=corner, top=chars[:2], bot=chars[2:], top_conf=conf, bot_conf=conf)
+                results.append((-1, 0.0, info))
+        return results
+
     def read_debug(self, square: np.ndarray) -> tuple[int, float, dict]:
         order, dark = corner_ranking(square)
         info = {"ranking": order, "corner": order[0], "orient_ok": True,
@@ -285,17 +343,31 @@ def decode_markers_cached(entries, recognizer, tracker):
     """
     detections = []
     pend = []
-    n_cnn = 0
+    # 先按位置分:已锁定(复用,跳过 CNN)/未锁定(要识别)
+    pre = []
+    unlocked_idx = []
+    unlocked_sq = []
     for pts, square in entries:
         center = tuple(float(v) for v in pts.mean(axis=0))
         cached = tracker.query_at(center)
+        pre.append((pts, square, center, cached))
+        if cached < 0:
+            unlocked_idx.append(len(pre) - 1)
+            unlocked_sq.append(square)
+    # 未锁定的:能批处理就一次前向(read_batch),否则逐个 read_debug
+    if unlocked_sq and hasattr(recognizer, "read_batch"):
+        batch = recognizer.read_batch(unlocked_sq)
+    else:
+        batch = [recognizer.read_debug(sq) for sq in unlocked_sq]
+    n_cnn = len(unlocked_sq)
+    bmap = dict(zip(unlocked_idx, batch))
+    for k, (pts, square, center, cached) in enumerate(pre):
         if cached >= 0:
             corner = corner_ranking(square)[0][0]      # 便宜,无 CNN
             detections.append((cached, 0.9, center))
             pend.append((pts, center, corner, None))
         else:
-            mid, conf, info = recognizer.read_debug(square)   # CNN
-            n_cnn += 1
+            mid, conf, info = bmap[k]
             detections.append((mid, conf, center))
             pend.append((pts, center, info["corner"], info))
     tracker.update(detections)
@@ -304,6 +376,44 @@ def decode_markers_cached(entries, recognizer, tracker):
         items.append({"pts": pts, "center": center, "corner": corner,
                       "id": tracker.query_at(center), "info": info})
     return items, n_cnn
+
+
+class _FrameGrabber:
+    """后台线程持续抓帧,只保留最新一帧——把相机 read 延迟移出主循环,
+    并丢弃缓冲旧帧(消除滞后)。主循环 read() 立即拿到最新帧。"""
+
+    def __init__(self, src, exposure):
+        self.cap = cv2.VideoCapture(src, cv2.CAP_DSHOW)
+        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+        self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
+        self.cap.set(cv2.CAP_PROP_EXPOSURE, exposure)
+        self._lock = threading.Lock()
+        self._frame = None
+        self._stop = False
+        self._t = threading.Thread(target=self._loop, daemon=True)
+        self._t.start()
+
+    def _loop(self):
+        while not self._stop:
+            ok, f = self.cap.read()
+            if ok:
+                with self._lock:
+                    self._frame = f
+
+    def read(self):
+        with self._lock:
+            f = self._frame
+        return (f is not None), (None if f is None else f.copy())
+
+    def isOpened(self):
+        return self.cap.isOpened()
+
+    def release(self):
+        self._stop = True
+        self._t.join(timeout=1.0)
+        self.cap.release()
 
 
 def main() -> int:
@@ -319,6 +429,8 @@ def main() -> int:
                         help="cnn=轻量数字分类器(默认,快); ocr=RapidOCR(对照)。")
     parser.add_argument("--no-track", action="store_true", default=False,
                         help="关掉多帧投票+解码缓存(每帧都重新识别,慢但无状态)。")
+    parser.add_argument("--no-thread", action="store_true", default=False,
+                        help="关掉后台抓帧线程(相机 read 回到主循环,慢)。")
     parser.add_argument("--mirror", action="store_true", default=False)
     parser.add_argument("--camera-exposure", type=int, default=None)
     parser.add_argument("--debug-dir", default=None,
@@ -351,13 +463,17 @@ def main() -> int:
     win = "Digit Marker TRI"
 
     src = int(args.source) if args.source.isdigit() else args.source
-    cap = cv2.VideoCapture(src, cv2.CAP_DSHOW)
-    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
     exposure = args.camera_exposure if args.camera_exposure is not None else -6
-    cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
-    cap.set(cv2.CAP_PROP_EXPOSURE, exposure)
+    if args.no_thread:
+        cap = cv2.VideoCapture(src, cv2.CAP_DSHOW)
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+        cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
+        cap.set(cv2.CAP_PROP_EXPOSURE, exposure)
+    else:
+        cap = _FrameGrabber(src, exposure)
+        time.sleep(0.5)        # 等后台线程抓到第一帧
     cv2.namedWindow(win, cv2.WINDOW_NORMAL)
     print("Digit Marker TRI decoder. Esc=quit.")
 
