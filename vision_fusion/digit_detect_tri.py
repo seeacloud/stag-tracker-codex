@@ -256,7 +256,7 @@ class DigitClassifierTri:
     """
 
     def __init__(self, model_path: str = "models/tri_digit_cnn.pt",
-                 min_cell_conf: float = 0.6, max_orient: int = 2):
+                 min_cell_conf: float = 0.9, max_orient: int = 2):
         import torch
         from .nn_train_digit import DigitCNN
         self.torch = torch
@@ -460,6 +460,8 @@ def main() -> int:
     parser.add_argument("--conf", type=float, default=0.3)
     parser.add_argument("--recognizer", choices=["cnn", "ocr"], default="cnn",
                         help="cnn=轻量数字分类器(默认,快); ocr=RapidOCR(对照)。")
+    parser.add_argument("--min-cell-conf", type=float, default=0.9,
+                        help="接受 id 所需的 4 格最低置信度门槛(高=宁缺毋滥,少错 id;低=多解出)。")
     parser.add_argument("--no-track", action="store_true", default=False,
                         help="关掉多帧投票+解码缓存(每帧都重新识别,慢但无状态)。")
     parser.add_argument("--no-thread", action="store_true", default=False,
@@ -484,8 +486,8 @@ def main() -> int:
     if args.recognizer == "cnn":
         from pathlib import Path as _P
         if _P("models/tri_digit_cnn.pt").exists():
-            recognizer = DigitClassifierTri()
-            print("recognizer: CNN (tri_digit_cnn.pt)")
+            recognizer = DigitClassifierTri(min_cell_conf=args.min_cell_conf)
+            print(f"recognizer: CNN (tri_digit_cnn.pt), min_cell_conf={args.min_cell_conf}")
         else:
             print("WARN: models/tri_digit_cnn.pt 缺失，回退 RapidOCR")
             recognizer = DigitRecognizerTri()
