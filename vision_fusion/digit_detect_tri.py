@@ -104,7 +104,10 @@ def _xy_grid(h: int, w: int):
 def _corner_triangle_darkness(gray: np.ndarray) -> list[float]:
     """4 个角各取一块直角三角区(贴角、斜边朝中心，正好罩黑三角该在的楔形)，
     返回各自"比局部光照平面暗多少"。**先拟合并减去线性光照平面**(抗 IR 画面的
-    明暗梯度——否则整片偏暗的角会被误当三角);三角是局部暗楔,梯度是大坡,平面只吃坡。"""
+    明暗梯度——否则整片偏暗的角会被误当三角);三角是局部暗楔,梯度是大坡,平面只吃坡。
+    在 64×64 下采样上算(方向是粗决策、梯度平滑,精度无损,省每帧 plane 拟合开销)。"""
+    if gray.shape[0] != 64:
+        gray = cv2.resize(gray, (64, 64), interpolation=cv2.INTER_AREA)
     g = gray.astype(np.float32)
     h, w = g.shape
     s = h
@@ -256,7 +259,7 @@ class DigitClassifierTri:
     """
 
     def __init__(self, model_path: str = "models/tri_digit_cnn.pt",
-                 min_cell_conf: float = 0.9, max_orient: int = 2):
+                 min_cell_conf: float = 0.9, max_orient: int = 1):
         import torch
         from .nn_train_digit import DigitCNN
         self.torch = torch
@@ -366,44 +369,27 @@ class DigitClassifierTri:
         return mid, conf
 
 
-def decode_markers_cached(entries, recognizer, tracker):
-    """一帧多 marker 的"解码一次就缓存"。
+def decode_markers_cached(entries, recognizer, tracker, decay: float = 0.6):
+    """一帧多 marker:**每帧都重新识别**(批处理,便宜),用衰减投票平滑。
 
-    entries: list[(pts, square)]。已被 tracker 投票锁定的 marker 直接复用其稳定 id、
-    **跳过 CNN**(只用便宜的 corner_ranking 算方向给箭头);未锁定的才跑
-    recognizer.read_debug(CNN)。返回 (items, n_cnn)，item={pts,center,corner,id}，
-    id 为投票后的稳定 id(-1=未锁定→显示 ?)。这样静止 marker 锁定后每帧 decode≈0。
+    不再按位置缓存跳过识别——否则 marker 被换/移动时旧位置会赖着旧 id(位置记忆 bug)。
+    每帧 read_batch 重读所有 marker → 喂 tracker.update(decay) 衰减投票 → query_at 取稳定 id。
+    这样 id 永远跟随"当前帧实际读到的",换 marker 几帧内接管;衰减投票仍消单帧 flicker。
+    entries: list[(pts, square)]。返回 (items, n_cnn),item={pts,center,corner,id,info}。
     """
+    squares = [sq for _, sq in entries]
+    if squares and hasattr(recognizer, "read_batch"):
+        reads = recognizer.read_batch(squares)
+    else:
+        reads = [recognizer.read_debug(sq) for sq in squares]
+    n_cnn = len(squares)
     detections = []
     pend = []
-    # 先按位置分:已锁定(复用 id,跳过 CNN)/未锁定(要识别)
-    pre = []
-    unlocked_idx = []
-    unlocked_sq = []
-    for pts, square in entries:
+    for (pts, _sq), (mid, conf, info) in zip(entries, reads):
         center = tuple(float(v) for v in pts.mean(axis=0))
-        cached = tracker.query_at(center)
-        pre.append((pts, square, center, cached))
-        if cached < 0:
-            unlocked_idx.append(len(pre) - 1)
-            unlocked_sq.append(square)
-    # 未锁定的:能批处理就一次前向(read_batch),否则逐个 read_debug
-    if unlocked_sq and hasattr(recognizer, "read_batch"):
-        batch = recognizer.read_batch(unlocked_sq)
-    else:
-        batch = [recognizer.read_debug(sq) for sq in unlocked_sq]
-    n_cnn = len(unlocked_sq)
-    bmap = dict(zip(unlocked_idx, batch))
-    for k, (pts, square, center, cached) in enumerate(pre):
-        if cached >= 0:
-            corner = corner_ranking(square)[0][0]      # 每帧老实算方向(无 CNN)
-            detections.append((cached, 0.9, center))
-            pend.append((pts, center, corner, None))
-        else:
-            mid, conf, info = bmap[k]
-            detections.append((mid, conf, center))
-            pend.append((pts, center, info["corner"], info))
-    tracker.update(detections)
+        detections.append((mid, conf, center))
+        pend.append((pts, center, info["corner"], info))
+    tracker.update(detections, decay=decay)
     items = []
     for pts, center, corner, info in pend:
         items.append({"pts": pts, "center": center, "corner": corner,

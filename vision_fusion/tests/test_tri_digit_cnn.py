@@ -50,27 +50,31 @@ def test_marker_chars_maps_cells():
 
 
 class _FakeRec:
-    """假识别器,计 read_debug 调用次数(不需 torch)。"""
-    def __init__(self):
+    """假识别器(不需 torch),返回值可改以模拟换 marker。"""
+    def __init__(self, ret=83):
         self.calls = 0
+        self.ret = ret
     def read_debug(self, square):
         self.calls += 1
-        return 83, 0.9, {"corner": 0, "ranking": [0, 1, 2, 3]}
+        return self.ret, 0.95, {"corner": 0, "ranking": [0, 1, 2, 3]}
 
 
-def test_decode_cache_skips_cnn_after_lock():
+def test_decode_rereads_every_frame_and_follows_swap():
+    """每帧都重新识别(不靠位置缓存赖着旧 id);marker 被换后 id 要跟着翻过来。"""
     from vision_fusion.digit_detect_tri import decode_markers_cached
     from vision_fusion.digit_detect import MarkerTracker
-    tr = MarkerTracker(); rec = _FakeRec()
+    tr = MarkerTracker(); rec = _FakeRec(83)
     sq = np.zeros((200, 200), np.uint8)
     pts = np.array([[100, 100], [140, 100], [140, 140], [100, 140]], np.float32)
     items = None
+    for _ in range(5):
+        items, _ = decode_markers_cached([(pts, sq)], rec, tr)
+    assert rec.calls == 5, f"应每帧都重读,实际只调 {rec.calls} 次(又在按位置缓存跳过)"
+    assert items[0]["id"] == 83
+    rec.ret = 47                       # 同位置换上另一个 marker
     for _ in range(6):
-        items, n_cnn = decode_markers_cached([(pts, sq)], rec, tr)
-    # 锁定(投票权重过阈)后应停止再调 CNN
-    assert rec.calls <= 2, f"locked 后仍调用 CNN {rec.calls} 次"
-    assert items[0]["id"] == 83            # 显示投票后的稳定 id
-    assert "corner" in items[0]            # 方向(箭头)信息总在
+        items, _ = decode_markers_cached([(pts, sq)], rec, tr)
+    assert items[0]["id"] == 47, f"换 marker 后 id 未跟随,仍={items[0]['id']}(位置记忆赖旧 id)"
 
 
 import os
