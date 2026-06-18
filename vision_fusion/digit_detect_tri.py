@@ -209,6 +209,60 @@ class DigitRecognizerTri:
         return mid, conf
 
 
+class DigitClassifierTri:
+    """轻量 CNN(0-9+X)读 2×2 数字 + 加权 mod11 校验，替代 RapidOCR。
+
+    接口同 DigitRecognizerTri：read_debug/recognize。4 格一次 batch 推理；
+    按角暗度排序逐朝向试，首个过 decode_id 校验的采纳。全 4 朝向也才 16 次微推理。
+    """
+
+    def __init__(self, model_path: str = "models/tri_digit_cnn.pt"):
+        import torch
+        from .nn_train_digit import DigitCNN
+        self.torch = torch
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.model = DigitCNN(num_classes=len(CHARS)).to(self.device)
+        self.model.load_state_dict(torch.load(model_path, map_location=self.device))
+        self.model.eval()
+
+    def _classify(self, cells: list) -> tuple[str, float]:
+        """4 格 → (4 字符串, 平均置信度)。一次 batch 推理。"""
+        batch = np.stack([c.astype(np.float32) / 255.0 for c in cells])[:, None]
+        x = self.torch.from_numpy(batch).to(self.device)
+        with self.torch.no_grad():
+            prob = self.torch.softmax(self.model(x), dim=1)
+            conf, idx = prob.max(dim=1)
+        chars = "".join(CHARS[i] for i in idx.tolist())
+        return chars, float(conf.mean().item())
+
+    def read_debug(self, square: np.ndarray) -> tuple[int, float, dict]:
+        order, dark = corner_ranking(square)
+        info = {"ranking": order, "corner": order[0], "orient_ok": True,
+                "orient_conf": (dark[order[0]] - dark[order[1]]) / (dark[order[0]] + 1e-6),
+                "top": "", "bot": "", "top_conf": 0.0, "bot_conf": 0.0}
+        first = None
+        for corner in order:
+            rot = _ROT_TO_TL[corner]
+            o = square if rot is None else cv2.rotate(square, rot)
+            chars, conf = self._classify(slice_cells(o))
+            if first is None:
+                first = (corner, chars, conf, o)
+            if decode_id(chars) >= 0:
+                info.update(corner=corner, top=chars[:2], bot=chars[2:],
+                            top_conf=conf, bot_conf=conf, _oriented=o)
+                return decode_id(chars), conf, info
+        c, chars, conf, o = first
+        info.update(corner=c, top=chars[:2], bot=chars[2:],
+                    top_conf=conf, bot_conf=conf, _oriented=o)
+        return -1, 0.0, info
+
+    def recognize(self, square: np.ndarray, min_conf: float = 0.5) -> tuple[int, float]:
+        mid, conf, _ = self.read_debug(square)
+        if mid < 0 or conf < min_conf:
+            return -1, 0.0
+        return mid, conf
+
+
 def main() -> int:
     from ultralytics import YOLO
     from .digit_detect import (order_corners, warp_square, draw_corners,
