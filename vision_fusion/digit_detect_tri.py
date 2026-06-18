@@ -370,22 +370,26 @@ def main() -> int:
                     dbg_log.flush()
                     dbg_n += 1
                 center = pts.mean(axis=0)
+                # 三段解耦,各画各的:
+                # 1) 检出 marker(YOLO)→ 绿框(总是画)
+                draw_corners(disp, pts, color=(0, 220, 0))
+                # 2) 找到方向(暗度最暗角)→ 箭头(总是画,与 id 是否解出无关)
+                mc, up = marker_up_vector(pts, corner)
+                ordered = order_corners(pts)
+                arrow_len = 0.6 * np.hypot(*(ordered[0] - mc))
+                tip = (int(mc[0] + up[0] * arrow_len), int(mc[1] + up[1] * arrow_len))
+                cv2.arrowedLine(disp, (int(mc[0]), int(mc[1])), tip,
+                                (0, 0, 255), 1, cv2.LINE_AA, tipLength=0.3)
+                # 3) 解出 id → 显示数字;没解出 → 小灰 ?(框和箭头照样在)
                 if marker_id >= 0:
                     n_ok += 1
-                    draw_corners(disp, pts, color=(0, 220, 0))
                     anchor = id_anchor(pts, corner)
                     cv2.putText(disp, f"{marker_id:03d}", (int(anchor[0]) - 14, int(anchor[1]) + 6),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 220, 0), 1, cv2.LINE_AA)
-                    mc, up = marker_up_vector(pts, corner)
-                    ordered = order_corners(pts)
-                    arrow_len = 0.6 * np.hypot(*(ordered[0] - mc))
-                    tip = (int(mc[0] + up[0] * arrow_len), int(mc[1] + up[1] * arrow_len))
-                    cv2.arrowedLine(disp, (int(mc[0]), int(mc[1])), tip,
-                                    (0, 0, 255), 1, cv2.LINE_AA, tipLength=0.3)
                 else:
-                    draw_corners(disp, pts, color=(0, 180, 180))
                     cv2.putText(disp, "?", (int(center[0]) - 5, int(center[1]) + 5),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 180, 180), 1, cv2.LINE_AA)
+
         t_dec = time.perf_counter() - t
 
         t_frame = time.perf_counter() - f0
