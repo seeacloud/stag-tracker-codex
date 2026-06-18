@@ -49,6 +49,30 @@ def test_marker_chars_maps_cells():
     assert marker_chars(7) == "007X"    # 007 + 校验X(=10)
 
 
+class _FakeRec:
+    """假识别器,计 read_debug 调用次数(不需 torch)。"""
+    def __init__(self):
+        self.calls = 0
+    def read_debug(self, square):
+        self.calls += 1
+        return 83, 0.9, {"corner": 0, "ranking": [0, 1, 2, 3]}
+
+
+def test_decode_cache_skips_cnn_after_lock():
+    from vision_fusion.digit_detect_tri import decode_markers_cached
+    from vision_fusion.digit_detect import MarkerTracker
+    tr = MarkerTracker(); rec = _FakeRec()
+    sq = np.zeros((200, 200), np.uint8)
+    pts = np.array([[100, 100], [140, 100], [140, 140], [100, 140]], np.float32)
+    items = None
+    for _ in range(6):
+        items, n_cnn = decode_markers_cached([(pts, sq)], rec, tr)
+    # 锁定(投票权重过阈)后应停止再调 CNN
+    assert rec.calls <= 2, f"locked 后仍调用 CNN {rec.calls} 次"
+    assert items[0]["id"] == 83            # 显示投票后的稳定 id
+    assert "corner" in items[0]            # 方向(箭头)信息总在
+
+
 import os
 from pathlib import Path
 

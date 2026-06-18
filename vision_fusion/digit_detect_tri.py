@@ -275,10 +275,41 @@ class DigitClassifierTri:
         return mid, conf
 
 
+def decode_markers_cached(entries, recognizer, tracker):
+    """一帧多 marker 的"解码一次就缓存"。
+
+    entries: list[(pts, square)]。已被 tracker 投票锁定的 marker 直接复用其稳定 id、
+    **跳过 CNN**(只用便宜的 corner_ranking 算方向给箭头);未锁定的才跑
+    recognizer.read_debug(CNN)。返回 (items, n_cnn)，item={pts,center,corner,id}，
+    id 为投票后的稳定 id(-1=未锁定→显示 ?)。这样静止 marker 锁定后每帧 decode≈0。
+    """
+    detections = []
+    pend = []
+    n_cnn = 0
+    for pts, square in entries:
+        center = tuple(float(v) for v in pts.mean(axis=0))
+        cached = tracker.query_at(center)
+        if cached >= 0:
+            corner = corner_ranking(square)[0][0]      # 便宜,无 CNN
+            detections.append((cached, 0.9, center))
+            pend.append((pts, center, corner, None))
+        else:
+            mid, conf, info = recognizer.read_debug(square)   # CNN
+            n_cnn += 1
+            detections.append((mid, conf, center))
+            pend.append((pts, center, info["corner"], info))
+    tracker.update(detections)
+    items = []
+    for pts, center, corner, info in pend:
+        items.append({"pts": pts, "center": center, "corner": corner,
+                      "id": tracker.query_at(center), "info": info})
+    return items, n_cnn
+
+
 def main() -> int:
     from ultralytics import YOLO
     from .digit_detect import (order_corners, warp_square, draw_corners,
-                               marker_up_vector, id_anchor)
+                               marker_up_vector, id_anchor, MarkerTracker)
 
     parser = argparse.ArgumentParser(description="Digit marker (tri) decoder.")
     parser.add_argument("--source", default="0")
@@ -286,6 +317,8 @@ def main() -> int:
     parser.add_argument("--conf", type=float, default=0.3)
     parser.add_argument("--recognizer", choices=["cnn", "ocr"], default="cnn",
                         help="cnn=轻量数字分类器(默认,快); ocr=RapidOCR(对照)。")
+    parser.add_argument("--no-track", action="store_true", default=False,
+                        help="关掉多帧投票+解码缓存(每帧都重新识别,慢但无状态)。")
     parser.add_argument("--mirror", action="store_true", default=False)
     parser.add_argument("--camera-exposure", type=int, default=None)
     parser.add_argument("--debug-dir", default=None,
@@ -328,6 +361,7 @@ def main() -> int:
     cv2.namedWindow(win, cv2.WINDOW_NORMAL)
     print("Digit Marker TRI decoder. Esc=quit.")
 
+    tracker = None if args.no_track else MarkerTracker()
     fps_ema = None          # 指数滑动平均,读数稳一点
     while True:
         f0 = time.perf_counter()
@@ -346,49 +380,55 @@ def main() -> int:
 
         disp = frame
         n_ok = 0
-        n_mk = 0
         t = time.perf_counter()
+        # 收集本帧所有检出 marker
+        entries = []
         for r in results:
             if r.obb is None:
                 continue
             for i in range(len(r.obb)):
                 pts = r.obb.xyxyxyxy[i].cpu().numpy().reshape(4, 2)
                 square = warp_square(enhanced, pts, size=200)
-                if square.size == 0:
-                    continue
-                n_mk += 1
-                marker_id, _conf, info = recognizer.read_debug(square)
-                corner = info["corner"]            # 校验通过时采纳的朝向角
-                if dbg is not None and dbg_n < 80:
-                    cv2.imwrite(str(dbg / f"m{dbg_n:03d}_orient.png"), info.get("_oriented", square))
-                    if "_top" in info:
-                        cv2.imwrite(str(dbg / f"m{dbg_n:03d}_top.png"), info["_top"])
-                        cv2.imwrite(str(dbg / f"m{dbg_n:03d}_bot.png"), info["_bot"])
-                    dbg_log.write(
-                        f"m{dbg_n:03d} ranking={info['ranking']} chosen={corner} "
-                        f"top='{info['top']}' bot='{info['bot']}' id={marker_id}\n")
-                    dbg_log.flush()
-                    dbg_n += 1
-                center = pts.mean(axis=0)
-                # 三段解耦,各画各的:
-                # 1) 检出 marker(YOLO)→ 绿框(总是画)
-                draw_corners(disp, pts, color=(0, 220, 0))
-                # 2) 找到方向(暗度最暗角)→ 箭头(总是画,与 id 是否解出无关)
-                mc, up = marker_up_vector(pts, corner)
-                ordered = order_corners(pts)
-                arrow_len = 0.6 * np.hypot(*(ordered[0] - mc))
-                tip = (int(mc[0] + up[0] * arrow_len), int(mc[1] + up[1] * arrow_len))
-                cv2.arrowedLine(disp, (int(mc[0]), int(mc[1])), tip,
-                                (0, 0, 255), 1, cv2.LINE_AA, tipLength=0.3)
-                # 3) 解出 id → 显示数字;没解出 → 小灰 ?(框和箭头照样在)
-                if marker_id >= 0:
-                    n_ok += 1
-                    anchor = id_anchor(pts, corner)
-                    cv2.putText(disp, f"{marker_id:03d}", (int(anchor[0]) - 14, int(anchor[1]) + 6),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 220, 0), 1, cv2.LINE_AA)
-                else:
-                    cv2.putText(disp, "?", (int(center[0]) - 5, int(center[1]) + 5),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 180, 180), 1, cv2.LINE_AA)
+                if square.size:
+                    entries.append((pts, square))
+        n_mk = len(entries)
+        # 解码:有跟踪→已锁定的跳过 CNN(稳态 decode≈0);无跟踪→每帧重识别
+        if tracker is not None:
+            items, _ = decode_markers_cached(entries, recognizer, tracker)
+        else:
+            items = []
+            for pts, square in entries:
+                mid, _c, info = recognizer.read_debug(square)
+                items.append({"pts": pts, "center": pts.mean(axis=0),
+                              "corner": info["corner"], "id": mid, "info": info})
+        t_dec = time.perf_counter() - t
+
+        for it in items:
+            pts, corner, marker_id = it["pts"], it["corner"], it["id"]
+            center = pts.mean(axis=0)
+            if dbg is not None and dbg_n < 80 and it.get("info"):
+                info = it["info"]
+                cv2.imwrite(str(dbg / f"m{dbg_n:03d}_orient.png"), info.get("_oriented", entries[0][1]))
+                dbg_log.write(f"m{dbg_n:03d} ranking={info['ranking']} chosen={corner} "
+                              f"top='{info['top']}' bot='{info['bot']}' id={marker_id}\n")
+                dbg_log.flush(); dbg_n += 1
+            # 三段解耦:1) 检出→绿框  2) 方向→箭头  3) 解出→id(总是各画各的)
+            draw_corners(disp, pts, color=(0, 220, 0))
+            mc, up = marker_up_vector(pts, corner)
+            ordered = order_corners(pts)
+            arrow_len = 0.6 * np.hypot(*(ordered[0] - mc))
+            tip = (int(mc[0] + up[0] * arrow_len), int(mc[1] + up[1] * arrow_len))
+            cv2.arrowedLine(disp, (int(mc[0]), int(mc[1])), tip,
+                            (0, 0, 255), 1, cv2.LINE_AA, tipLength=0.3)
+            if marker_id >= 0:
+                n_ok += 1
+                anchor = id_anchor(pts, corner)
+                cv2.putText(disp, f"{marker_id:03d}", (int(anchor[0]) - 14, int(anchor[1]) + 6),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 220, 0), 1, cv2.LINE_AA)
+            else:
+                cv2.putText(disp, "?", (int(center[0]) - 5, int(center[1]) + 5),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 180, 180), 1, cv2.LINE_AA)
+
 
         t_dec = time.perf_counter() - t
 
