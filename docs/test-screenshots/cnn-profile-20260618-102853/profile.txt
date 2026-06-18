@@ -1,0 +1,17 @@
+YOLO device: cuda:0   model: models/tri_marker_obb.pt
+frames: 6  iters/frame: 8
+
+avg markers/frame : 14.0
+avg OCR calls/frame: 0.0  (read_debug 最坏 = 8 × markers)
+
+  read(cap)       :   (摄像头,离线不测;实机约 30ms@30fps)
+  cvtColor gray   :    0.25 ms
+  CLAHE           :    1.83 ms
+  YOLO 定位       :    9.30 ms   (cuda:0)
+  warp_square 合计:    3.59 ms
+  decode 合计     :   33.52 ms   <-- 含全部 OCR
+    └ OCR 纯耗时  :    0.00 ms  (CPU, 0 次/帧)
+  ----------------
+  每帧合计(不含cap):   49.44 ms  →  20.2 FPS 上限
+
+OCR 占每帧计算量: 0%

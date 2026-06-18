@@ -100,17 +100,37 @@ python -m vision_fusion.digit_marker_tri_ui
 
 ### 切角数字 Marker 解码器 (digit_detect_tri)
 
-实时识别 tri marker：YOLO-OBB 定位 + 内角暗度三角定向（抗模糊）+ RapidOCR 读数 +
+实时识别 tri marker：YOLO-OBB 定位 + 内角暗度三角定向（抗模糊）+ 轻量 CNN 读数（0-9+X）+
 加权 mod11+X 校验。
 
 ```powershell
 python -m vision_fusion.digit_detect_tri --source 0
 ```
 
-绿框 + 三位 ID + 方向箭头；定向或校验存疑显示黄 `?`。`Esc` 退。默认模型
-`models\tri_marker_obb.pt`（专为 tri marker 训练，旧 `digi_marker_obb.pt` 对 tri 漏检严重）。
+绿框 + 三位 ID + 方向箭头；定向或校验存疑显示黄 `?`。左上角显示 FPS 与 read/yolo/decode 各步
+耗时。`Esc` 退。默认模型 `models\tri_marker_obb.pt`（专为 tri marker 训练，旧 `digi_marker_obb.pt`
+对 tri 漏检严重）。
+
+**识别默认走轻量 CNN（`--recognizer cnn`，模型 `models\tri_digit_cnn.pt`）**：2×2 切 4 格、
+11 类（0-9 与校验 X）分类器，比通用 RapidOCR 快约 100 倍（decode 5591ms→34ms，整链 0.2→20 FPS）
+且更准（只在合法字符里选）。`--recognizer ocr` 切回 RapidOCR 作对照。CNN 模型缺失时自动回退 OCR。
+
+训练 CNN 识别器（用 GUI 保存的字体/参数渲染 marker，切格自动打标，与推理同源切格）：
+
+```powershell
+# 1) 生成训练数据(0-9+X 单格 crop, 含退化增广)
+python -m vision_fusion.nn_synth_tri_digit --aug 20 --archive docs\test-screenshots\tri-slice-verify
+# 2) 训练 11 类分类器 → models\tri_digit_cnn.pt
+python -m vision_fusion.nn_train_tri_digit --data datasets\tri_digit_crops --epochs 15
+```
+
+> 切格几何（`TRI_COL_GAP`/`TRI_ROW_GAP`/`CELL_HALF`，在 `digit_detect_tri.py`）锁定当前
+> `digit_marker_tri_settings.json` 的列距/行距。若重调 marker 间距，需同步这两个值并重训分类器。
+
 合成 tri 检测训练数据：`python -m vision_fusion.gen_tri_yolo --count 800 --output datasets\tri_det`
 （marker 永不重叠，直接用 `digit_markers_tri` 导出的 PNG）。
+离线测管线各步耗时：`python -m vision_fusion.profile_tri_pipeline --recognizer cnn`。
+
 
 ### 屏幕坐标校准
 
