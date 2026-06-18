@@ -32,8 +32,22 @@ CHARS = "0123456789X"            # 11 类：0-9 与校验位 X(=10)
 # 若重调 marker 列距/行距，这两个值要同步更新并重训分类器。
 TRI_COL_GAP = 0.3765
 TRI_ROW_GAP = 0.4176
-CELL_HALF = 0.21                 # 归一化裁剪半边长(罩住单字、不蹭邻格)
+CELL_HALF = 0.20                 # 归一化裁剪半边长(罩住单字、不蹭邻格)
 CELL_OUT = 64                    # 输出格子尺寸(与 DigitCNN 输入一致)
+# 定向黑三角的几何(同 digit_marker_tri_settings.json)——切格前抹白,
+# 否则 TL 格会把三角当墨迹。大字体下裁剪窗必然触到三角,只能抹掉而非靠缩窗避开。
+TRI_BORDER_RATIO = 0.046
+TRI_CHAMFER_RATIO = 0.187
+
+
+def _mask_triangle(gray: np.ndarray) -> np.ndarray:
+    """把左上内角的定向黑三角抹成白色(返回副本)。三角定向已在上游完成,
+    此处只为净化 TL 数字格。楔形 [(0,0),(T,0),(0,T)],T 略大于 border+chamfer。"""
+    out = gray.copy()
+    s = out.shape[0]
+    T = int((TRI_BORDER_RATIO + TRI_CHAMFER_RATIO) * 1.12 * s)
+    cv2.fillConvexPoly(out, np.array([(0, 0), (T, 0), (0, T)], np.int32), 255)
+    return out
 
 
 def cell_centers(col_gap: float = TRI_COL_GAP, row_gap: float = TRI_ROW_GAP):
@@ -47,8 +61,9 @@ def cell_centers(col_gap: float = TRI_COL_GAP, row_gap: float = TRI_ROW_GAP):
 
 def slice_cells(square: np.ndarray, half: float = CELL_HALF, out: int = CELL_OUT):
     """把拉正后的 marker 切成 4 个数字格(灰度 out×out)。训练与推理共用，
-    保证几何一致。square 可为灰度或 BGR。"""
+    保证几何一致。先抹掉定向黑三角再切。square 可为灰度或 BGR。"""
     gray = cv2.cvtColor(square, cv2.COLOR_BGR2GRAY) if square.ndim == 3 else square
+    gray = _mask_triangle(gray)
     s = gray.shape[0]
     h = int(half * s)
     cells = []

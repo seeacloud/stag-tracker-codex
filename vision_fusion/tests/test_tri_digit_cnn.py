@@ -32,3 +32,18 @@ def test_slice_cells_capture_ink():
     g = generate_marker_tri(283, pixels=200)   # 2,8,3 + 校验, 四格都有字
     for cell in slice_cells(g):
         assert int(cell.min()) < 100
+
+
+def test_tl_cell_not_triangle_contaminated():
+    # 定向黑三角应被抹掉:TL 格(d1)左上角区域应为白(无三角墨迹)
+    g = generate_marker_tri(283, pixels=300)   # d1='2'
+    tl = slice_cells(g)[0]
+    H, W = tl.shape
+    corner = tl[:int(0.08 * H), :int(0.08 * W)]   # 极左上角(只该有三角的区域)
+    assert int(corner.min()) > 150, "TL 左上角有黑像素(三角未抹掉)"
+
+
+def test_marker_chars_maps_cells():
+    from vision_fusion.nn_synth_tri_digit import marker_chars
+    assert marker_chars(83) == "0833"   # 083 + 校验3
+    assert marker_chars(7) == "007X"    # 007 + 校验X(=10)
