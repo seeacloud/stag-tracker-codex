@@ -132,3 +132,20 @@ def test_read_batch_matches_read_debug():
     for (mid, p), (bid, _, _) in zip(samples, batch):
         did, _, _ = rec.read_debug(cv2.imread(p, cv2.IMREAD_GRAYSCALE))
         assert bid == did == mid, f"{mid}: batch={bid} debug={did}"
+
+
+def test_corner_ranking_survives_illumination_gradient():
+    """方向判断要抗光照梯度(去平面)——一侧整片偏暗不该把方向带偏。"""
+    from vision_fusion.digit_detect_tri import corner_ranking
+    cases = [(None, 0), (cv2.ROTATE_90_CLOCKWISE, 1),
+             (cv2.ROTATE_180, 2), (cv2.ROTATE_90_COUNTERCLOCKWISE, 3)]
+    g = generate_marker_tri(283, pixels=200)
+    h, w = g.shape
+    yy, xx = np.mgrid[0:h, 0:w]
+    ramp = ((xx + yy) / (h + w)).astype(np.float32)        # 左上→右下线性梯度
+    faint = (120 + g.astype(np.float32) / 255 * 45)        # 压成窄灰阶(很淡)
+    for rot, exp in cases:
+        im = faint if rot is None else cv2.rotate(faint, rot)
+        r = ramp if rot is None else cv2.rotate(ramp, rot)
+        im2 = np.clip(im + (r - 0.5) * 80, 0, 255).astype(np.uint8)   # 叠强梯度
+        assert corner_ranking(im2)[0][0] == exp, f"rot {rot} 方向判错"

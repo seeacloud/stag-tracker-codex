@@ -89,10 +89,37 @@ def slice_cells(square: np.ndarray, half: float = CELL_HALF, out: int = CELL_OUT
     return cells
 
 
+_GRID_CACHE: dict = {}
+
+
+def _xy_grid(h: int, w: int):
+    g = _GRID_CACHE.get((h, w))
+    if g is None:
+        yy, xx = np.mgrid[0:h, 0:w]
+        g = (xx.astype(np.float32), yy.astype(np.float32))
+        _GRID_CACHE[(h, w)] = g
+    return g
+
+
 def _corner_triangle_darkness(gray: np.ndarray) -> list[float]:
     """4 个角各取一块直角三角区(贴角、斜边朝中心，正好罩黑三角该在的楔形)，
-    返回各自的平均暗度 (255-灰度)。三角区比方块更聚焦三角、少蹭数字/背景。"""
-    s = gray.shape[0]
+    返回各自"比局部光照平面暗多少"。**先拟合并减去线性光照平面**(抗 IR 画面的
+    明暗梯度——否则整片偏暗的角会被误当三角);三角是局部暗楔,梯度是大坡,平面只吃坡。"""
+    g = gray.astype(np.float32)
+    h, w = g.shape
+    s = h
+    xx, yy = _xy_grid(h, w)
+    # 3×3 正规方程拟合 z=a·x+b·y+c(O(N) 求和,比 lstsq 快),残差=去梯度后的图
+    x = xx.ravel(); y = yy.ravel(); z = g.ravel(); n = z.size
+    Sx = x.sum(); Sy = y.sum(); Sxx = x @ x; Syy = y @ y; Sxy = x @ y
+    Sz = z.sum(); Sxz = x @ z; Syz = y @ z
+    M = np.array([[Sxx, Sxy, Sx], [Sxy, Syy, Sy], [Sx, Sy, n]], np.float64)
+    rhs = np.array([Sxz, Syz, Sz], np.float64)
+    try:
+        a, b, c = np.linalg.solve(M, rhs)
+        resid = g - (a * xx + b * yy + c)
+    except np.linalg.LinAlgError:
+        resid = g - g.mean()
     L = max(6, int(s * _TRI_L))
     tris = [
         [(0, 0), (L, 0), (0, L)],              # TL
@@ -100,12 +127,11 @@ def _corner_triangle_darkness(gray: np.ndarray) -> list[float]:
         [(s, s), (s - L, s), (s, s - L)],      # BR
         [(0, s), (L, s), (0, s - L)],          # BL
     ]
-    inv = 255.0 - gray.astype(np.float32)
     out = []
     for t in tris:
         m = np.zeros((s, s), np.uint8)
         cv2.fillConvexPoly(m, np.array(t, np.int32), 1)
-        out.append(float(inv[m == 1].mean()))
+        out.append(float(-resid[m == 1].mean()))   # 残差越暗(越负)→取负后越大→越像三角
     return out
 
 
@@ -343,7 +369,7 @@ def decode_markers_cached(entries, recognizer, tracker):
     """
     detections = []
     pend = []
-    # 先按位置分:已锁定(复用,跳过 CNN)/未锁定(要识别)
+    # 先按位置分:已锁定(复用 id,跳过 CNN)/未锁定(要识别)
     pre = []
     unlocked_idx = []
     unlocked_sq = []
@@ -363,7 +389,7 @@ def decode_markers_cached(entries, recognizer, tracker):
     bmap = dict(zip(unlocked_idx, batch))
     for k, (pts, square, center, cached) in enumerate(pre):
         if cached >= 0:
-            corner = corner_ranking(square)[0][0]      # 便宜,无 CNN
+            corner = corner_ranking(square)[0][0]      # 每帧老实算方向(无 CNN)
             detections.append((cached, 0.9, center))
             pend.append((pts, center, corner, None))
         else:
