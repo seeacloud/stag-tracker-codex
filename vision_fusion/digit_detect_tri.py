@@ -26,6 +26,18 @@ _ROT_TO_TL = {
 _TRI_L = 0.30  # 角三角取样区的腿长占比(罩住 marker 的黑三角，排除中央数字)
 
 
+def _ensure_gray(img: np.ndarray) -> np.ndarray:
+    """转单通道灰度，兼容 (H,W)/(H,W,1)/(H,W,3)/(H,W,4)。
+    ultralytics 会 patch cv2.imread，灰度读出可能是 (H,W,1)，单纯判 ndim==3 会误调 cvtColor。"""
+    if img.ndim == 2:
+        return img
+    if img.shape[2] == 1:
+        return img[:, :, 0]
+    if img.shape[2] == 4:
+        return cv2.cvtColor(img, cv2.COLOR_BGRA2GRAY)
+    return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+
 CHARS = "0123456789X"            # 11 类：0-9 与校验位 X(=10)
 
 # 切格几何锁定部署 marker 的 GUI 参数(digit_marker_tri_settings.json)。
@@ -62,7 +74,7 @@ def cell_centers(col_gap: float = TRI_COL_GAP, row_gap: float = TRI_ROW_GAP):
 def slice_cells(square: np.ndarray, half: float = CELL_HALF, out: int = CELL_OUT):
     """把拉正后的 marker 切成 4 个数字格(灰度 out×out)。训练与推理共用，
     保证几何一致。先抹掉定向黑三角再切。square 可为灰度或 BGR。"""
-    gray = cv2.cvtColor(square, cv2.COLOR_BGR2GRAY) if square.ndim == 3 else square
+    gray = _ensure_gray(square)
     gray = _mask_triangle(gray)
     s = gray.shape[0]
     h = int(half * s)
@@ -98,7 +110,7 @@ def _corner_triangle_darkness(gray: np.ndarray) -> list[float]:
 
 def corner_ranking(square: np.ndarray) -> tuple[list[int], list[float]]:
     """按三角区暗度从大到小给 4 个角排序，返回 (排序后的角下标, 各角暗度)。"""
-    gray = cv2.cvtColor(square, cv2.COLOR_BGR2GRAY) if square.ndim == 3 else square
+    gray = _ensure_gray(square)
     dark = _corner_triangle_darkness(gray)
     order = sorted(range(4), key=lambda i: dark[i], reverse=True)
     return order, dark
@@ -272,6 +284,8 @@ def main() -> int:
     parser.add_argument("--source", default="0")
     parser.add_argument("--model", default="models/tri_marker_obb.pt")
     parser.add_argument("--conf", type=float, default=0.3)
+    parser.add_argument("--recognizer", choices=["cnn", "ocr"], default="cnn",
+                        help="cnn=轻量数字分类器(默认,快); ocr=RapidOCR(对照)。")
     parser.add_argument("--mirror", action="store_true", default=False)
     parser.add_argument("--camera-exposure", type=int, default=None)
     parser.add_argument("--debug-dir", default=None,
@@ -289,7 +303,17 @@ def main() -> int:
         print(f"[debug] dumping per-marker decode info → {dbg}")
 
     yolo = YOLO(args.model)
-    recognizer = DigitRecognizerTri()
+    if args.recognizer == "cnn":
+        from pathlib import Path as _P
+        if _P("models/tri_digit_cnn.pt").exists():
+            recognizer = DigitClassifierTri()
+            print("recognizer: CNN (tri_digit_cnn.pt)")
+        else:
+            print("WARN: models/tri_digit_cnn.pt 缺失，回退 RapidOCR")
+            recognizer = DigitRecognizerTri()
+    else:
+        recognizer = DigitRecognizerTri()
+        print("recognizer: RapidOCR")
     clahe = cv2.createCLAHE(clipLimit=5.0, tileGridSize=(8, 8))
     win = "Digit Marker TRI"
 
