@@ -22,11 +22,15 @@ def marker_chars(marker_id: int) -> str:
 
 
 def render_marker_symbol(marker_id: int, *, pixels: int = 300, border_ratio: float = 0.06,
-                         bottom_extra_ratio: float = 0.06, pad_ratio: float = 0.08,
-                         col_gap_ratio: float = 0.38, row_gap_ratio: float = 0.42,
-                         sym_size_ratio: float = 0.30, stroke_ratio: float = 0.16,
-                         round_cap: bool = True) -> np.ndarray:
-    """渲染符号 marker(灰度,背景 255 墨 0)。底边为加宽黑条作定向。"""
+                         bottom_extra_ratio: float = 0.06, col_gap_ratio: float = 0.3765,
+                         row_gap_ratio: float = 0.4176, sym_size_ratio: float = 0.30,
+                         stroke_ratio: float = 0.16, round_cap: bool = True) -> np.ndarray:
+    """渲染符号 marker(灰度,背景 255 墨 0)。底边为加宽黑条作定向。
+
+    符号 2×2 中心对齐到画布正中 0.5(与 slice_cells 的切格中心一致),列/行距默认
+    用 slice_cells 的 TRI_COL_GAP/TRI_ROW_GAP,保证训练/推理切格几何完全一致。
+    底边黑条只压最底部 border+bottom_extra,不侵入符号区。
+    """
     p = pixels
     img = np.full((p, p), 255, np.uint8)
     b = int(p * border_ratio)
@@ -35,9 +39,7 @@ def render_marker_symbol(marker_id: int, *, pixels: int = 300, border_ratio: flo
     be = int(p * bottom_extra_ratio)                               # 底边加宽黑条(定向)
     cv2.rectangle(img, (b, p - 1 - b - be), (p - 1 - b, p - 1 - b), 0, -1)
 
-    pad = int(p * pad_ratio)
-    lo, hi = b + pad, p - 1 - b - be - pad
-    cx = cy = (lo + hi) / 2.0
+    cx = cy = (p - 1) / 2.0                                         # 内容居中 0.5(对齐 slice_cells)
     col = p * col_gap_ratio
     row = p * row_gap_ratio
     centers = [(cx - col / 2, cy - row / 2), (cx + col / 2, cy - row / 2),

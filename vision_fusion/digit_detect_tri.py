@@ -76,6 +76,20 @@ def _mask_triangle(gray: np.ndarray) -> np.ndarray:
     return out
 
 
+# 符号 marker 底边黑条的抹除阈值(归一化):底部该比例以下抹白。
+# 底符号最低到 ~0.86,黑条在 ~0.88 以下,取 0.87 既抹掉条又不伤符号。
+BOTTOM_BAR_MASK_FROM = 0.87
+
+
+def _mask_bottom_bar(gray: np.ndarray) -> np.ndarray:
+    """把底部定向黑条抹成白色(返回副本)。定向已在上游完成,此处净化底行符号格。"""
+    out = gray.copy()
+    s = out.shape[0]
+    out[int(s * BOTTOM_BAR_MASK_FROM):, :] = 255
+    return out
+
+
+
 def cell_centers(col_gap: float = TRI_COL_GAP, row_gap: float = TRI_ROW_GAP):
     """4 个数字格中心(归一化)，顺序 [TL d1, TR d2, BL d3, BR check]，
     与 generate_marker_tri 的 glyph 顺序一致。"""
@@ -86,15 +100,17 @@ def cell_centers(col_gap: float = TRI_COL_GAP, row_gap: float = TRI_ROW_GAP):
 
 
 def slice_cells(square: np.ndarray, half: float = CELL_HALF, out: int = CELL_OUT,
-                mask_tri: bool = True):
+                mask_tri: bool = True, mask_bottom: bool = False):
     """把拉正后的 marker 切成 4 个数字格(灰度 out×out)。训练与推理共用，
     保证几何一致。先逐 marker 归一化对比度;数字 marker 抹掉左上定向黑三角
-    (mask_tri=True);符号 marker 用底边黑条定向、内部无三角(mask_tri=False)。
-    square 可为灰度或 BGR。"""
+    (mask_tri=True);符号 marker 用底边黑条定向,抹掉底条(mask_bottom=True、
+    mask_tri=False)。square 可为灰度或 BGR。"""
     gray = _ensure_gray(square)
     gray = normalize_square(gray)          # 逐 marker 对比拉伸(训练/推理同源)
     if mask_tri:
         gray = _mask_triangle(gray)
+    if mask_bottom:
+        gray = _mask_bottom_bar(gray)
     s = gray.shape[0]
     h = int(half * s)
     cells = []
