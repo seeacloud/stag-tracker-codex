@@ -6,7 +6,9 @@
 
 ## 目标
 
-把 tri marker 的 2×2 **数字**(0-9 + 校验 X)替换成一套 **11 个高区分度几何符号**,从源头压低识别误判;沿用现有 tri 管线(YOLO-OBB 框定 + 内角黑三角定向 + warp + 切格 + CNN 分类 + 加权 mod11 校验 + 多帧投票),只换"每格内容"。
+把 tri marker 的 2×2 **数字**(0-9 + 校验 X)替换成一套 **11 个高区分度几何符号**,从源头压低识别误判;**定向标记从"左上内角黑三角"改为"底边加宽黑条"**(信号更强、抗模糊更好、不占内部、不蹭符号格)。沿用 tri 管线主体(YOLO-OBB 框定 + warp + 切格 + CNN 分类 + 加权 mod11 校验 + 多帧投票),换"每格内容"+"定向方式"。
+
+> **定向变更(底边黑条)**:外框为完整方框,**底边比其它三边明显加粗**(一条宽黑带)。定向 = 比 4 条边的暗度(去线性平面后),最暗边 = 底边 → 据此把 marker 旋正。取代原"4 角三角暗度"。理由:整条边信号量远大于小三角,重模糊/梯度下更稳;且在外框上,不侵占内部、切格无需抹除三角。前 3 格编 ID、第 4 格加权 mod11+X 校验(不变)。
 
 ## 动机(数据支撑)
 
@@ -42,42 +44,35 @@
 
 ## 架构:复用 + 替换
 
-**全部复用(不改)**:YOLO-OBB 检测(`tri_marker_obb.pt`)、内角黑三角定向(`corner_ranking` 去平面)、`warp_square`、`slice_cells`(切格几何 + 归一化 + 抹三角)、`DigitCNN` 架构、加权 mod11+X 校验逻辑、`MarkerTracker` 多帧投票、解码缓存、HUD/调参。
+**复用(不改)**:YOLO-OBB 检测(`tri_marker_obb.pt`)、`warp_square`、`slice_cells` 的归一化+切格几何、`DigitCNN` 架构、加权 mod11+X 校验、`MarkerTracker` 多帧投票、解码缓存、HUD/调参。
 
-**只替换**:2×2 格子里的字形渲染(数字字形 → 符号画法)。
+**替换两处**:① 2×2 格子内容(数字字形 → 符号画法);② **定向方式(内角三角 → 底边黑条 + 边暗度定向)**——`slice_cells` 的"抹三角"改成不需要(底边黑条在外框、不进格);新增"4 边暗度定向"取代 `corner_ranking` 的角定向。
 
 ## 组件与改动
 
 1. **`vision_fusion/symbol_set.py`(新建)** — 符号库的唯一真相源:
    - `SYMBOLS = "0123456789X"`(逻辑标签,沿用,方便复用 checksum_char/decode_id)
-   - `draw_symbol(idx_or_char, size) -> np.ndarray`:按上表画 64×64 符号。
-   - `render_marker_symbol(marker_id, **layout)`:复刻 `generate_marker_tri` 的外框+内角黑三角+2×2 布局,但每格用 `draw_symbol` 画符号(而非数字字形)。
+   - `draw_symbol(char, size, stroke, round_cap=True) -> np.ndarray`:按 v8 符号表画 64×64,统一线宽 stroke、圆角线头。
 
-2. **`vision_fusion/nn_synth_tri_digit.py`(参数化或新建 symbol 版)** — 训练数据生成:marker 渲染换成符号版,切格(`slice_cells`)、退化、`--scene` 采集真实样本全沿用。输出 `datasets/symbol_crops/<char>/`。
+2. **`vision_fusion/symbol_marker.py`(新建)** — `render_marker_symbol(marker_id, **layout)`:复刻 `generate_marker_tri` 的外框 + 2×2 中心布局,但**定向用底边加宽黑条**(底边 border 比其它三边粗 `bottom_extra`),格内用 `draw_symbol`。CLI 批量导出。复用 `checksum_char`。
 
-3. **训练** — 复用 `nn_train_tri_digit`(`DigitCNN` 11 类),数据指向符号 crops,产出 `models/symbol_cnn.pt`。
+3. **定向(底边黑条)** — 在 `digit_detect_tri.py` 新增 `edge_ranking(square)`:对 warp 后方图,去线性平面后比 4 条边(上/右/下/左)带状区暗度,返回最暗边;`orient_by_edge` 把最暗边旋到底部。取代符号路径的 `corner_ranking`。`slice_cells` 加开关跳过"抹三角"(符号路径不需要)。
 
-4. **识别** — `DigitClassifierTri` 加 `model_path` 参数即可指向 `symbol_cnn.pt`;`decode_id`/`checksum_char` 完全不变(逻辑标签仍是 0-9+X)。
+4. **训练数据 `vision_fusion/nn_synth_symbol.py`(新建)** — 渲染符号 marker → `slice_cells`(不抹三角) → 退化 + `--scene` → `datasets/symbol_crops/<char>/`。复用 `nn_augment`/`overlay_marker`。
 
-5. **`digit_detect_tri.py`** — 加 `--symbol` 开关:用 `symbol_cnn.pt` + 符号渲染。HUD 显示时把逻辑 id 映射回符号或仍显示数字 id(数字 id 更有用,符号只是物理编码)。
+5. **训练** — 复用 `nn_train_tri_digit`,`--data datasets/symbol_crops --out models/symbol_cnn.pt`(`DigitCNN` 11 类)。
 
-6. **`vision_fusion/symbol_marker_ui.py`(新建)** — Tkinter 调参 GUI(复刻 `digit_marker_tri_ui` 机制):
-   实时预览 + 区间批量导出 + 参数自动存取。可调参数(滑块/输入):
-   - **线宽(stroke width)**:所有符号统一用此线宽绘制(一个值控全部)。
-   - **圆角线头**:所有线条末端圆角(画线用圆端点 + 抗锯齿;实心块四角可选圆角半径)。
-   - **符号大小**:符号在单格内的占比。
-   - **列距(字符间距)**、**行距(行高)**:2×2 格的横/纵间隔。
-   - **marker padding**:内容区四周留白。
-   - 三角定向标记大小、边框宽度(沿用 tri 的几何参数)。
-   - **参数自动保存/加载**:存 `symbol_marker_settings.json`,启动自动加载上次值,改动/关闭时自动保存(WM_DELETE + Save 按钮,同 digit_marker_tri_ui)。
+6. **识别** — `DigitClassifierTri(model_path="models/symbol_cnn.pt")`,定向注入 `edge_ranking`;`decode_id`/`checksum_char` 不变。`digit_detect_tri.main` 加 `--symbol` 开关(切到符号模型 + 边定向 + 不抹三角)。
 
-   `draw_symbol` 必须接受这些参数(线宽、圆角、大小),`render_marker_symbol` 接受布局参数(列距/行距/padding/三角大小/边框),GUI 只是它们的可视化前端。训练数据生成与实时识别都从 `symbol_marker_settings.json` 读同一套参数,保证渲染/训练/推理一致。
+7. **`vision_fusion/symbol_marker_ui.py`(新建)** — Tkinter 调参 GUI(复刻 `digit_marker_tri_ui`):
+   实时预览 + 区间批量导出 + 参数自动存取 `symbol_marker_settings.json`(启动加载、改动/关闭保存)。可调:**统一线宽、圆角开关、符号大小、列距、行距、padding、边框宽度、底边黑条额外宽度**。
+   `draw_symbol`/`render_marker_symbol` 接受这些参数,GUI 只是前端;训练生成与识别都读同一 json,保证渲染/训练/推理一致。
 
-## 数据流(不变)
+## 数据流
 
 ```
 帧 → 灰度 → CLAHE ─┬─ YOLO-OBB 框定
-                   └─ warp 拉正 → 三角定向 → slice_cells(归一化+切4格)
+                   └─ warp 拉正 → 底边黑条定向(edge_ranking 去平面) → slice_cells(归一化+切4格,不抹三角)
                        → CNN(symbol_cnn) 读 4 符号 → 逻辑标签 0-9+X
                        → decode_id 加权 mod11 校验 → marker_id → 多帧投票
 ```
