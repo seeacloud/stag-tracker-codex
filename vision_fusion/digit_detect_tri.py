@@ -342,17 +342,24 @@ class DigitClassifierTri:
                     "top": "", "bot": "", "top_conf": 0.0, "bot_conf": 0.0}
             cands = per_sq[si]                      # 已按 order 顺序
             first = cands[0]
-            chosen = None
+            # 找首个过校验的朝向(先不管置信度门槛),记下它的最低格置信度供 HUD 显示
+            valid = None
             for corner, chars, conf, mn in cands:
-                if decode_id(chars) >= 0 and mn >= self.min_cell_conf:   # 校验 + 置信度门槛
-                    chosen = (decode_id(chars), conf, corner, chars); break
-            if chosen is not None:
-                mid, conf, corner, chars = chosen
-                info.update(corner=corner, top=chars[:2], bot=chars[2:], top_conf=conf, bot_conf=conf)
-                results.append((mid, conf, info))
+                if decode_id(chars) >= 0:
+                    valid = (decode_id(chars), conf, corner, chars, mn)
+                    break
+            if valid is not None:
+                mid, conf, corner, chars, mn = valid
+                info.update(corner=corner, top=chars[:2], bot=chars[2:],
+                            top_conf=conf, bot_conf=conf, min_conf=mn)
+                if mn >= self.min_cell_conf:        # 过门槛才输出 id;否则 -1 但保留 min_conf
+                    results.append((mid, conf, info))
+                else:
+                    results.append((-1, 0.0, info))
             else:
                 corner, chars, conf, mn = first
-                info.update(corner=corner, top=chars[:2], bot=chars[2:], top_conf=conf, bot_conf=conf)
+                info.update(corner=corner, top=chars[:2], bot=chars[2:],
+                            top_conf=conf, bot_conf=conf, min_conf=mn)
                 results.append((-1, 0.0, info))
         return results
 
@@ -612,11 +619,15 @@ def main() -> int:
             if marker_id >= 0:
                 n_ok += 1
                 anchor = id_anchor(pts, corner)
-                cv2.putText(disp, f"{marker_id:03d}", (int(anchor[0]) - 14, int(anchor[1]) + 6),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 220, 0), 1, cv2.LINE_AA)
+                mn = it.get("info", {}).get("min_conf", 0.0) if it.get("info") else 0.0
+                cv2.putText(disp, f"{marker_id:03d}:{mn:.2f}", (int(anchor[0]) - 14, int(anchor[1]) + 6),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 220, 0), 1, cv2.LINE_AA)
             else:
-                cv2.putText(disp, "?", (int(center[0]) - 5, int(center[1]) + 5),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 180, 180), 1, cv2.LINE_AA)
+                # 没解出:若有候选(过校验但置信度不够)显示"差多少",否则纯 ?
+                mn = it.get("info", {}).get("min_conf", None) if it.get("info") else None
+                txt = "?" if mn is None else f"?{mn:.2f}"
+                cv2.putText(disp, txt, (int(center[0]) - 5, int(center[1]) + 5),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 180, 180), 1, cv2.LINE_AA)
 
 
         t_dec = time.perf_counter() - t
@@ -641,6 +652,11 @@ def main() -> int:
         cv2.putText(shown,
                     f"read {t_read*1000:.0f} | yolo {t_yolo*1000:.0f} | decode {t_dec*1000:.0f} ms",
                     (10, 48), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
+        # 当前置信度门槛 + 调整提示(+/- 实时调,marker 旁数字=该marker最低格置信度)
+        thr = getattr(recognizer, "min_cell_conf", None)
+        if thr is not None:
+            cv2.putText(shown, f"min_cell_conf={thr:.2f}  ( +/- 调门槛, id旁数字=最低格置信度 )",
+                        (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 255), 1, cv2.LINE_AA)
         cv2.imshow(win, shown)
         key = cv2.waitKey(1) & 0xFF
         if key == 27:                                      # Esc 退
@@ -649,6 +665,10 @@ def main() -> int:
             view_i = (view_i + 1) % len(_VIEWS)
         elif ord('1') <= key <= ord('3'):                 # 1-3 直接选
             view_i = min(key - ord('1'), len(_VIEWS) - 1)
+        elif key in (ord('+'), ord('=')) and thr is not None:   # 升门槛(更严)
+            recognizer.min_cell_conf = min(0.99, round(thr + 0.02, 2))
+        elif key in (ord('-'), ord('_')) and thr is not None:   # 降门槛(更松)
+            recognizer.min_cell_conf = max(0.0, round(thr - 0.02, 2))
 
     cap.release()
     cv2.destroyAllWindows()
