@@ -85,13 +85,16 @@ def cell_centers(col_gap: float = TRI_COL_GAP, row_gap: float = TRI_ROW_GAP):
             (0.5 + col_gap / 2, 0.5 + row_gap / 2)]
 
 
-def slice_cells(square: np.ndarray, half: float = CELL_HALF, out: int = CELL_OUT):
+def slice_cells(square: np.ndarray, half: float = CELL_HALF, out: int = CELL_OUT,
+                mask_tri: bool = True):
     """把拉正后的 marker 切成 4 个数字格(灰度 out×out)。训练与推理共用，
-    保证几何一致。先逐 marker 归一化对比度、再抹掉定向黑三角、再切。
+    保证几何一致。先逐 marker 归一化对比度;数字 marker 抹掉左上定向黑三角
+    (mask_tri=True);符号 marker 用底边黑条定向、内部无三角(mask_tri=False)。
     square 可为灰度或 BGR。"""
     gray = _ensure_gray(square)
     gray = normalize_square(gray)          # 逐 marker 对比拉伸(训练/推理同源)
-    gray = _mask_triangle(gray)
+    if mask_tri:
+        gray = _mask_triangle(gray)
     s = gray.shape[0]
     h = int(half * s)
     cells = []
@@ -159,6 +162,48 @@ def corner_ranking(square: np.ndarray) -> tuple[list[int], list[float]]:
     dark = _corner_triangle_darkness(gray)
     order = sorted(range(4), key=lambda i: dark[i], reverse=True)
     return order, dark
+
+
+# 符号 marker 用"底边加宽黑条"定向:比 4 条边带暗度,最暗边=底边。
+# 边索引: 0上 1右 2下 3左。把最暗边旋到底部的 cv2 旋转:
+_EDGE_ROT_TO_BOTTOM = {2: None, 3: cv2.ROTATE_90_CLOCKWISE,
+                       0: cv2.ROTATE_180, 1: cv2.ROTATE_90_COUNTERCLOCKWISE}
+
+
+def _edge_band_darkness(gray: np.ndarray) -> list[float]:
+    """去线性光照平面后,比 4 条边带(上/右/下/左)的平均暗度。抗梯度,同角定向。"""
+    g = gray.astype(np.float32)
+    h, w = g.shape
+    xx, yy = _xy_grid(h, w)
+    x = xx.ravel(); y = yy.ravel(); z = g.ravel(); n = z.size
+    M = np.array([[x @ x, x @ y, x.sum()], [x @ y, y @ y, y.sum()],
+                  [x.sum(), y.sum(), n]], np.float64)
+    rhs = np.array([x @ z, y @ z, z.sum()], np.float64)
+    try:
+        a, b, c = np.linalg.solve(M, rhs)
+        r = g - (a * xx + b * yy + c)
+    except np.linalg.LinAlgError:
+        r = g - g.mean()
+    s = h
+    t = max(4, int(s * 0.12))
+    m0, m1 = int(s * 0.2), int(s * 0.8)
+    bands = [r[0:t, m0:m1], r[m0:m1, s - t:s], r[s - t:s, m0:m1], r[m0:m1, 0:t]]  # 上右下左
+    return [float(-bnd.mean()) for bnd in bands]
+
+
+def edge_ranking(square: np.ndarray) -> tuple[list[int], list[float]]:
+    """4 条边按暗度从大到小排序(去平面),返回 (排序后的边下标, 各边暗度)。0上1右2下3左。"""
+    gray = _ensure_gray(square)
+    dk = _edge_band_darkness(gray)
+    order = sorted(range(4), key=lambda i: dk[i], reverse=True)
+    return order, dk
+
+
+def orient_by_edge(square: np.ndarray) -> np.ndarray:
+    """把最暗边旋到底部(符号 marker 定向)。"""
+    order, _ = edge_ranking(square)
+    rot = _EDGE_ROT_TO_BOTTOM[order[0]]
+    return square if rot is None else cv2.rotate(square, rot)
 
 
 def find_triangle_corner(square: np.ndarray) -> tuple[int, float]:

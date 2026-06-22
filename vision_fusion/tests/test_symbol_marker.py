@@ -50,3 +50,25 @@ def test_render_marker_symbol():
     top = g[:int(300 * 0.04), 20:280].mean()
     assert bottom < 80, f"底边应是黑条 mean={bottom:.0f}"
     assert top < 80, f"顶边是普通黑框 mean={top:.0f}"   # 顶也是边框(黑),但更细
+
+
+def test_edge_ranking_finds_bottom():
+    import cv2
+    from vision_fusion.symbol_marker import render_marker_symbol
+    from vision_fusion.digit_detect_tri import edge_ranking
+    g = render_marker_symbol(283, pixels=200)            # 底边黑条
+    order, _ = edge_ranking(g)
+    assert order[0] == 2, f"正放最暗边应为底(2),实际 {order[0]}"   # 0上1右2下3左
+    assert edge_ranking(cv2.rotate(g, cv2.ROTATE_180))[0][0] == 0   # 旋180→黑条到顶
+
+
+def test_edge_ranking_survives_gradient():
+    import cv2
+    from vision_fusion.symbol_marker import render_marker_symbol
+    from vision_fusion.digit_detect_tri import edge_ranking
+    g = render_marker_symbol(283, pixels=200).astype(np.float32)
+    h, w = g.shape
+    yy, xx = np.mgrid[0:h, 0:w]
+    ramp = ((xx + yy) / (h + w)).astype(np.float32)
+    g2 = np.clip(g + (ramp - 0.5) * 80, 0, 255).astype(np.uint8)   # 叠强梯度
+    assert edge_ranking(g2)[0][0] == 2, "去平面后梯度不该带偏底边判断"
