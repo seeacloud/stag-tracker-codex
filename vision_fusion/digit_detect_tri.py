@@ -90,21 +90,22 @@ def _mask_bottom_bar(gray: np.ndarray) -> np.ndarray:
 
 
 
-def cell_centers(col_gap: float = TRI_COL_GAP, row_gap: float = TRI_ROW_GAP):
-    """4 个数字格中心(归一化)，顺序 [TL d1, TR d2, BL d3, BR check]，
-    与 generate_marker_tri 的 glyph 顺序一致。"""
-    return [(0.5 - col_gap / 2, 0.5 - row_gap / 2),
-            (0.5 + col_gap / 2, 0.5 - row_gap / 2),
-            (0.5 - col_gap / 2, 0.5 + row_gap / 2),
-            (0.5 + col_gap / 2, 0.5 + row_gap / 2)]
+def cell_centers(col_gap: float = TRI_COL_GAP, row_gap: float = TRI_ROW_GAP,
+                 center_y: float = 0.5):
+    """4 个数字格中心(归一化)，顺序 [TL d1, TR d2, BL d3, BR check]。
+    center_y: 2×2 的垂直中心(数字 marker=0.5;符号 marker 上移避让底条)。"""
+    return [(0.5 - col_gap / 2, center_y - row_gap / 2),
+            (0.5 + col_gap / 2, center_y - row_gap / 2),
+            (0.5 - col_gap / 2, center_y + row_gap / 2),
+            (0.5 + col_gap / 2, center_y + row_gap / 2)]
 
 
 def slice_cells(square: np.ndarray, half: float = CELL_HALF, out: int = CELL_OUT,
-                mask_tri: bool = True, mask_bottom: bool = False):
+                mask_tri: bool = True, mask_bottom: bool = False, center_y: float = 0.5):
     """把拉正后的 marker 切成 4 个数字格(灰度 out×out)。训练与推理共用，
     保证几何一致。先逐 marker 归一化对比度;数字 marker 抹掉左上定向黑三角
     (mask_tri=True);符号 marker 用底边黑条定向,抹掉底条(mask_bottom=True、
-    mask_tri=False)。square 可为灰度或 BGR。"""
+    mask_tri=False)。center_y: 2×2 垂直中心(符号 marker 上移)。square 可为灰度或 BGR。"""
     gray = _ensure_gray(square)
     gray = normalize_square(gray)          # 逐 marker 对比拉伸(训练/推理同源)
     if mask_tri:
@@ -114,7 +115,7 @@ def slice_cells(square: np.ndarray, half: float = CELL_HALF, out: int = CELL_OUT
     s = gray.shape[0]
     h = int(half * s)
     cells = []
-    for ncx, ncy in cell_centers():
+    for ncx, ncy in cell_centers(center_y=center_y):
         cx, cy = int(ncx * s), int(ncy * s)
         x0, x1 = max(0, cx - h), min(s, cx + h)
         y0, y1 = max(0, cy - h), min(s, cy + h)
@@ -187,24 +188,23 @@ _EDGE_ROT_TO_BOTTOM = {2: None, 3: cv2.ROTATE_90_CLOCKWISE,
 
 
 def _edge_band_darkness(gray: np.ndarray) -> list[float]:
-    """去线性光照平面后,比 4 条边带(上/右/下/左)的平均暗度。抗梯度,同角定向。"""
-    g = gray.astype(np.float32)
-    h, w = g.shape
-    xx, yy = _xy_grid(h, w)
-    x = xx.ravel(); y = yy.ravel(); z = g.ravel(); n = z.size
-    M = np.array([[x @ x, x @ y, x.sum()], [x @ y, y @ y, y.sum()],
-                  [x.sum(), y.sum(), n]], np.float64)
-    rhs = np.array([x @ z, y @ z, z.sum()], np.float64)
-    try:
-        a, b, c = np.linalg.solve(M, rhs)
-        r = g - (a * xx + b * yy + c)
-    except np.linalg.LinAlgError:
-        r = g - g.mean()
-    s = h
-    t = max(4, int(s * 0.12))
-    m0, m1 = int(s * 0.2), int(s * 0.8)
-    bands = [r[0:t, m0:m1], r[m0:m1, s - t:s], r[s - t:s, m0:m1], r[m0:m1, 0:t]]  # 上右下左
-    return [float(-bnd.mean()) for bnd in bands]
+    """量 4 条边的"边框厚度"(从边中线往里数连续黑像素长度)。底边=边框+黑条最厚。
+    返回 [上,右,下,左] 的厚度;越大越像底条所在边。几何量,不受符号/光照干扰
+    (marker 中线落在两符号之间,是空的)。"""
+    g = normalize_square(_ensure_gray(gray))      # 拉满对比,黑边清晰
+    s = g.shape[0]
+    thr = 110
+    lo, hi = int(s * 0.42), int(s * 0.58)         # 中线附近(两符号之间)取均值
+
+    def run_len(line: np.ndarray) -> float:
+        idx = np.where(line >= thr)[0]             # 第一个非黑的位置 = 黑边长度
+        return float(idx[0]) if len(idx) else float(len(line))
+
+    top = np.mean([run_len(g[:, c]) for c in range(lo, hi)])
+    bottom = np.mean([run_len(g[::-1, c]) for c in range(lo, hi)])
+    left = np.mean([run_len(g[r, :]) for r in range(lo, hi)])
+    right = np.mean([run_len(g[r, ::-1]) for r in range(lo, hi)])
+    return [float(top), float(right), float(bottom), float(left)]
 
 
 def edge_ranking(square: np.ndarray) -> tuple[list[int], list[float]]:
@@ -336,7 +336,8 @@ class DigitClassifierTri:
 
     def __init__(self, model_path: str = "models/tri_digit_cnn.pt",
                  min_cell_conf: float = 0.80, max_orient: int = 1,
-                 orient=None, mask_tri: bool = True, mask_bottom: bool = False):
+                 orient=None, mask_tri: bool = True, mask_bottom: bool = False,
+                 center_y: float = 0.5):
         import torch
         from .nn_train_digit import DigitCNN
         self.torch = torch
@@ -347,14 +348,16 @@ class DigitClassifierTri:
         self.min_cell_conf = min_cell_conf
         self.max_orient = max_orient
         # 定向函数:数字用 corner_ranking(默认),符号用 edge_ranking。切格抹除:
-        # 数字抹左上三角(mask_tri),符号抹底边黑条(mask_bottom)。
+        # 数字抹左上三角(mask_tri),符号抹底边黑条(mask_bottom)。center_y:符号区上移。
         self.orient = orient if orient is not None else corner_ranking
         self.rot_map = _EDGE_ROT_TO_BOTTOM if self.orient is edge_ranking else _ROT_TO_TL
         self.mask_tri = mask_tri
         self.mask_bottom = mask_bottom
+        self.center_y = center_y
 
     def _slice(self, sq):
-        return slice_cells(sq, mask_tri=self.mask_tri, mask_bottom=self.mask_bottom)
+        return slice_cells(sq, mask_tri=self.mask_tri, mask_bottom=self.mask_bottom,
+                           center_y=self.center_y)
 
     def _classify(self, cells: list) -> tuple[str, float, float]:
         """4 格 → (4 字符串, 平均置信度, 最低单格置信度)。一次 batch 推理。"""

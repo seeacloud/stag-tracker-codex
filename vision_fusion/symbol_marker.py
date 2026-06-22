@@ -14,7 +14,12 @@ import cv2
 import numpy as np
 
 from .digit_marker_tri import checksum_char
+from .digit_detect_tri import TRI_COL_GAP, TRI_ROW_GAP
 from .symbol_set import draw_symbol
+
+# 2×2 符号区垂直中心(归一化)。<0.5 表示上移,给底部黑条让位。
+# render 与识别(slice_cells)共用此值,保证切格几何一致。
+SYM_CENTER_Y = 0.44
 
 
 def marker_chars(marker_id: int) -> str:
@@ -22,24 +27,24 @@ def marker_chars(marker_id: int) -> str:
 
 
 def render_marker_symbol(marker_id: int, *, pixels: int = 300, border_ratio: float = 0.06,
-                         bottom_extra_ratio: float = 0.06, col_gap_ratio: float = 0.3765,
-                         row_gap_ratio: float = 0.4176, sym_size_ratio: float = 0.30,
+                         bottom_extra_ratio: float = 0.06, col_gap_ratio: float = TRI_COL_GAP,
+                         row_gap_ratio: float = TRI_ROW_GAP, sym_size_ratio: float = 0.30,
                          stroke_ratio: float = 0.16, round_cap: bool = True) -> np.ndarray:
-    """渲染符号 marker(灰度,背景 255 墨 0)。底边为加宽黑条作定向。
+    """渲染符号 marker(灰度,背景 255 墨 0)。正方形画布。
 
-    符号 2×2 中心对齐到画布正中 0.5(与 slice_cells 的切格中心一致),列/行距默认
-    用 slice_cells 的 TRI_COL_GAP/TRI_ROW_GAP,保证训练/推理切格几何完全一致。
-    底边黑条只压最底部 border+bottom_extra,不侵入符号区。
+    底条在正方形内底部(厚 = border + bottom_extra);2×2 符号区**整体上移**避让底条,
+    垂直中心在 SYM_CENTER_Y(<0.5),与 slice_cells 的切格中心一致。横向居中 0.5。
     """
     p = pixels
-    img = np.full((p, p), 255, np.uint8)
+    be = int(p * bottom_extra_ratio)
+    img = np.full((p, p), 255, np.uint8)                            # 正方形画布
     b = int(p * border_ratio)
     cv2.rectangle(img, (0, 0), (p - 1, p - 1), 0, -1)               # 全黑
     cv2.rectangle(img, (b, b), (p - 1 - b, p - 1 - b), 255, -1)     # 挖白 → 黑边框
-    be = int(p * bottom_extra_ratio)                               # 底边加宽黑条(定向)
-    cv2.rectangle(img, (b, p - 1 - b - be), (p - 1 - b, p - 1 - b), 0, -1)
+    cv2.rectangle(img, (b, p - 1 - b - be), (p - 1 - b, p - 1 - b), 0, -1)  # 底条(区内底部)
 
-    cx = cy = (p - 1) / 2.0                                         # 内容居中 0.5(对齐 slice_cells)
+    cx = (p - 1) / 2.0                                              # 横向居中
+    cy = SYM_CENTER_Y * (p - 1)                                    # 纵向上移(避让底条)
     col = p * col_gap_ratio
     row = p * row_gap_ratio
     centers = [(cx - col / 2, cy - row / 2), (cx + col / 2, cy - row / 2),

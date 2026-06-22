@@ -19,7 +19,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from .symbol_marker import render_marker_symbol, marker_chars
+from .symbol_marker import render_marker_symbol, marker_chars, SYM_CENTER_Y
 from .digit_detect_tri import slice_cells, CHARS, _ensure_gray, orient_by_edge
 from .digit_detect import warp_square
 from .nn_augment import random_degrade
@@ -42,13 +42,13 @@ def _render_params() -> dict:
     if not p.exists():
         return {}
     s = json.loads(p.read_text(encoding="utf-8"))
-    keys = ("pixels", "border_ratio", "bottom_extra_ratio", "col_gap_ratio",
-            "row_gap_ratio", "sym_size_ratio", "stroke_ratio")
+    keys = ("pixels", "border_ratio", "bottom_extra_ratio",
+            "sym_size_ratio", "stroke_ratio")    # 不含 gap:列/行距锁定 TRI 常量,与切格一致
     return {k: s[k] for k in keys if k in s}
 
 
 def _slice(sq):
-    return slice_cells(sq, mask_tri=False, mask_bottom=True)
+    return slice_cells(sq, mask_tri=False, mask_bottom=True, center_y=SYM_CENTER_Y)
 
 
 def main() -> int:

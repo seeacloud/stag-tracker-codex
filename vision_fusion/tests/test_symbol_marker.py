@@ -81,8 +81,9 @@ import os, pytest
 def test_symbol_recognize_roundtrip():
     from vision_fusion.symbol_marker import render_marker_symbol
     from vision_fusion.digit_detect_tri import DigitClassifierTri, edge_ranking
+    from vision_fusion.symbol_marker import SYM_CENTER_Y
     rec = DigitClassifierTri(model_path="models/symbol_cnn.pt",
-                             orient=edge_ranking, mask_tri=False, mask_bottom=True)
+                             orient=edge_ranking, mask_tri=False, mask_bottom=True, center_y=SYM_CENTER_Y)
     for mid in (83, 7, 20, 99, 283):       # 7→007X 含校验 X
         got, _ = rec.recognize(render_marker_symbol(mid, pixels=200), min_conf=0.0)
         assert got == mid, f"{mid} → {got}"
