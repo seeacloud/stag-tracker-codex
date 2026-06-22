@@ -39,3 +39,14 @@ def test_symbol_separability_beats_digits():
     mind = min(float(np.linalg.norm(F[a] - F[b]))
                for a, b in itertools.combinations(SYMBOLS, 2))
     assert mind > 30.0, f"区分度 {mind:.1f} 不及预期(数字基线 23.5)"
+
+
+def test_render_marker_symbol():
+    from vision_fusion.symbol_marker import render_marker_symbol, marker_chars
+    assert marker_chars(83) == "0833"        # 复用 checksum_char
+    g = render_marker_symbol(83, pixels=300)
+    assert g.shape == (300, 300) and g.dtype == np.uint8
+    bottom = g[int(300 * 0.93):, 20:280].mean()
+    top = g[:int(300 * 0.04), 20:280].mean()
+    assert bottom < 80, f"底边应是黑条 mean={bottom:.0f}"
+    assert top < 80, f"顶边是普通黑框 mean={top:.0f}"   # 顶也是边框(黑),但更细
