@@ -72,3 +72,17 @@ def test_edge_ranking_survives_gradient():
     ramp = ((xx + yy) / (h + w)).astype(np.float32)
     g2 = np.clip(g + (ramp - 0.5) * 80, 0, 255).astype(np.uint8)   # 叠强梯度
     assert edge_ranking(g2)[0][0] == 2, "去平面后梯度不该带偏底边判断"
+
+
+import os, pytest
+
+
+@pytest.mark.skipif(not os.path.exists("models/symbol_cnn.pt"), reason="symbol_cnn 未训练")
+def test_symbol_recognize_roundtrip():
+    from vision_fusion.symbol_marker import render_marker_symbol
+    from vision_fusion.digit_detect_tri import DigitClassifierTri, edge_ranking
+    rec = DigitClassifierTri(model_path="models/symbol_cnn.pt",
+                             orient=edge_ranking, mask_tri=False, mask_bottom=True)
+    for mid in (83, 7, 20, 99, 283):       # 7→007X 含校验 X
+        got, _ = rec.recognize(render_marker_symbol(mid, pixels=200), min_conf=0.0)
+        assert got == mid, f"{mid} → {got}"

@@ -335,7 +335,8 @@ class DigitClassifierTri:
     """
 
     def __init__(self, model_path: str = "models/tri_digit_cnn.pt",
-                 min_cell_conf: float = 0.80, max_orient: int = 1):
+                 min_cell_conf: float = 0.80, max_orient: int = 1,
+                 orient=None, mask_tri: bool = True, mask_bottom: bool = False):
         import torch
         from .nn_train_digit import DigitCNN
         self.torch = torch
@@ -343,11 +344,17 @@ class DigitClassifierTri:
         self.model = DigitCNN(num_classes=len(CHARS)).to(self.device)
         self.model.load_state_dict(torch.load(model_path, map_location=self.device))
         self.model.eval()
-        # 接受一个读数需:① 过加权 mod11 校验 ② 4 格里**最低**置信度 ≥ min_cell_conf
-        # (淡 marker 误读常有某格 0.4~0.6 在瞎猜,挡掉避免凑巧撞合法编号的假阳性)。
         self.min_cell_conf = min_cell_conf
-        # 只试暗度排序前 max_orient 个朝向(去梯度后暗度可靠),杜绝"末位朝向凑合法编号"。
         self.max_orient = max_orient
+        # 定向函数:数字用 corner_ranking(默认),符号用 edge_ranking。切格抹除:
+        # 数字抹左上三角(mask_tri),符号抹底边黑条(mask_bottom)。
+        self.orient = orient if orient is not None else corner_ranking
+        self.rot_map = _EDGE_ROT_TO_BOTTOM if self.orient is edge_ranking else _ROT_TO_TL
+        self.mask_tri = mask_tri
+        self.mask_bottom = mask_bottom
+
+    def _slice(self, sq):
+        return slice_cells(sq, mask_tri=self.mask_tri, mask_bottom=self.mask_bottom)
 
     def _classify(self, cells: list) -> tuple[str, float, float]:
         """4 格 → (4 字符串, 平均置信度, 最低单格置信度)。一次 batch 推理。"""
@@ -384,12 +391,12 @@ class DigitClassifierTri:
         owner = []           # (square_idx, corner)
         rankings = []
         for si, sq in enumerate(squares):
-            order, dark = corner_ranking(sq)
+            order, dark = self.orient(sq)
             rankings.append((order, dark))
             for corner in order[:self.max_orient]:     # 只试暗度前 N 个朝向
-                rot = _ROT_TO_TL[corner]
+                rot = self.rot_map[corner]
                 o = sq if rot is None else cv2.rotate(sq, rot)
-                groups.append(slice_cells(o))
+                groups.append(self._slice(o))
                 owner.append((si, corner))
         preds = self._classify_many(groups)        # 一次前向
         per_sq = {}
@@ -425,15 +432,15 @@ class DigitClassifierTri:
         return results
 
     def read_debug(self, square: np.ndarray) -> tuple[int, float, dict]:
-        order, dark = corner_ranking(square)
+        order, dark = self.orient(square)
         info = {"ranking": order, "corner": order[0], "orient_ok": True,
                 "orient_conf": (dark[order[0]] - dark[order[1]]) / (dark[order[0]] + 1e-6),
                 "top": "", "bot": "", "top_conf": 0.0, "bot_conf": 0.0}
         first = None
         for corner in order[:self.max_orient]:
-            rot = _ROT_TO_TL[corner]
+            rot = self.rot_map[corner]
             o = square if rot is None else cv2.rotate(square, rot)
-            chars, conf, mn = self._classify(slice_cells(o))
+            chars, conf, mn = self._classify(self._slice(o))
             if first is None:
                 first = (corner, chars, conf, o)
             if decode_id(chars) >= 0 and mn >= self.min_cell_conf:
