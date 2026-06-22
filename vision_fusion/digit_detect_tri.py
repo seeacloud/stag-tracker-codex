@@ -274,7 +274,7 @@ class DigitClassifierTri:
     """
 
     def __init__(self, model_path: str = "models/tri_digit_cnn.pt",
-                 min_cell_conf: float = 0.9, max_orient: int = 1):
+                 min_cell_conf: float = 0.80, max_orient: int = 1):
         import torch
         from .nn_train_digit import DigitCNN
         self.torch = torch
@@ -493,7 +493,7 @@ def main() -> int:
     parser.add_argument("--conf", type=float, default=0.3)
     parser.add_argument("--recognizer", choices=["cnn", "ocr"], default="cnn",
                         help="cnn=轻量数字分类器(默认,快); ocr=RapidOCR(对照)。")
-    parser.add_argument("--min-cell-conf", type=float, default=0.9,
+    parser.add_argument("--min-cell-conf", type=float, default=0.80,
                         help="接受 id 所需的 4 格最低置信度门槛(高=宁缺毋滥,少错 id;低=多解出)。")
     parser.add_argument("--no-track", action="store_true", default=False,
                         help="关掉多帧投票+解码缓存(每帧都重新识别,慢但无状态)。")
