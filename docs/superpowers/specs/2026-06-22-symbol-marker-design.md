@@ -36,6 +36,10 @@
 > 镜像对(⊢/⊣、╱/╲)经测距离最大(60+)——因三角定向已把 marker 转正、方向固定,镜像不会混。
 > 最难对 dring/⊢ = 53.5。无实心糊块隐患。
 
+> **绘制要求(贯穿所有符号)**:统一线宽(一个 stroke 值控全部线条/块边)、所有线条末端**圆角**
+> (画线用圆端点 cv2.LINE_AA + round cap;实心块可选圆角)、符号大小可调。上表坐标是 t=12 时的
+> 参考形状,实际由参数驱动缩放;dring 实心圆/box 空心方框的"线宽"指描边宽度(box)或随大小缩放(dring)。
+
 ## 架构:复用 + 替换
 
 **全部复用(不改)**:YOLO-OBB 检测(`tri_marker_obb.pt`)、内角黑三角定向(`corner_ranking` 去平面)、`warp_square`、`slice_cells`(切格几何 + 归一化 + 抹三角)、`DigitCNN` 架构、加权 mod11+X 校验逻辑、`MarkerTracker` 多帧投票、解码缓存、HUD/调参。
@@ -56,6 +60,18 @@
 4. **识别** — `DigitClassifierTri` 加 `model_path` 参数即可指向 `symbol_cnn.pt`;`decode_id`/`checksum_char` 完全不变(逻辑标签仍是 0-9+X)。
 
 5. **`digit_detect_tri.py`** — 加 `--symbol` 开关:用 `symbol_cnn.pt` + 符号渲染。HUD 显示时把逻辑 id 映射回符号或仍显示数字 id(数字 id 更有用,符号只是物理编码)。
+
+6. **`vision_fusion/symbol_marker_ui.py`(新建)** — Tkinter 调参 GUI(复刻 `digit_marker_tri_ui` 机制):
+   实时预览 + 区间批量导出 + 参数自动存取。可调参数(滑块/输入):
+   - **线宽(stroke width)**:所有符号统一用此线宽绘制(一个值控全部)。
+   - **圆角线头**:所有线条末端圆角(画线用圆端点 + 抗锯齿;实心块四角可选圆角半径)。
+   - **符号大小**:符号在单格内的占比。
+   - **列距(字符间距)**、**行距(行高)**:2×2 格的横/纵间隔。
+   - **marker padding**:内容区四周留白。
+   - 三角定向标记大小、边框宽度(沿用 tri 的几何参数)。
+   - **参数自动保存/加载**:存 `symbol_marker_settings.json`,启动自动加载上次值,改动/关闭时自动保存(WM_DELETE + Save 按钮,同 digit_marker_tri_ui)。
+
+   `draw_symbol` 必须接受这些参数(线宽、圆角、大小),`render_marker_symbol` 接受布局参数(列距/行距/padding/三角大小/边框),GUI 只是它们的可视化前端。训练数据生成与实时识别都从 `symbol_marker_settings.json` 读同一套参数,保证渲染/训练/推理一致。
 
 ## 数据流(不变)
 
