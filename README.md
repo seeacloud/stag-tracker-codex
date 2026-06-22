@@ -117,6 +117,10 @@ python -m vision_fusion.digit_detect_tri --source 0
 票数 margin 压假阳性);③ CNN 批处理(一帧所有未锁定 marker 拼一次前向)。带窗口稳态 ~37 FPS。
 `--no-track` 关投票缓存、`--no-thread` 关抓帧线程(调试用,会变慢)。
 
+**实时窗口按 `Tab`(或数字 `1`-`5`)切换看每个 pass 的处理效果**:1 最终叠加(框+箭头+id)、
+2 原始灰度、3 CLAHE 增强(YOLO 输入)、4 warp 拉正的单 marker、5 归一化+切 4 格(送 CNN 的样子)。
+方便逐步验证检出/增强/切格各环节,出问题能看到是哪一步。`Esc` 退。
+
 **识别默认走轻量 CNN（`--recognizer cnn`，模型 `models\tri_digit_cnn.pt`）**：2×2 切 4 格、
 11 类（0-9 与校验 X）分类器，比通用 RapidOCR 快约 100 倍（decode 5591ms→34ms，整链 0.2→20 FPS）
 且更准（只在合法字符里选）。`--recognizer ocr` 切回 RapidOCR 作对照。CNN 模型缺失时自动回退 OCR。

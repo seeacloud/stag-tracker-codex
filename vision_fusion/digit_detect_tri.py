@@ -547,6 +547,11 @@ def main() -> int:
 
     tracker = None if args.no_track else MarkerTracker()
     fps_ema = None          # 指数滑动平均,读数稳一点
+    # 按 Tab(或 1-5)切换实时画面看每个 pass 的处理效果:
+    _VIEWS = ["final", "gray", "clahe", "warp", "cells"]
+    _VIEW_DESC = {"final": "最终叠加(框+箭头+id)", "gray": "原始灰度", "clahe": "CLAHE 增强(YOLO输入)",
+                  "warp": "warp 拉正(第一个marker)", "cells": "归一化+切4格(第一个marker)"}
+    view_i = 0
     while True:
         f0 = time.perf_counter()
         t = time.perf_counter()
@@ -619,15 +624,45 @@ def main() -> int:
         t_frame = time.perf_counter() - f0
         inst_fps = 1.0 / t_frame if t_frame > 0 else 0.0
         fps_ema = inst_fps if fps_ema is None else 0.9 * fps_ema + 0.1 * inst_fps
-        # 左上角:FPS + 每步 ms(read/yolo/decode),decode 一般是大头。
-        cv2.putText(disp, f"FPS:{fps_ema:4.1f}  IDs:{n_ok}/{n_mk}", (10, 25),
+
+        # 按当前 view 选要显示的画面(看每个 pass 的处理效果)
+        view = _VIEWS[view_i]
+        H, W = frame.shape[:2]
+        if view == "final":
+            shown = disp
+        elif view == "gray":
+            shown = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+        elif view == "clahe":
+            shown = cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
+        elif view == "warp" and entries:
+            sq = cv2.resize(entries[0][1], (min(H, W), min(H, W)), interpolation=cv2.INTER_NEAREST)
+            shown = cv2.cvtColor(sq, cv2.COLOR_GRAY2BGR)
+        elif view == "cells" and entries:
+            cells = slice_cells(entries[0][1])            # 归一化+抹三角+切4格
+            grid = np.vstack([np.hstack([cells[0], cells[1]]),
+                              np.hstack([cells[2], cells[3]])])
+            grid = cv2.resize(grid, (min(H, W), min(H, W)), interpolation=cv2.INTER_NEAREST)
+            shown = cv2.cvtColor(grid, cv2.COLOR_GRAY2BGR)
+        else:                                              # warp/cells 但本帧没检出 marker
+            shown = cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
+            cv2.putText(shown, "no marker this frame", (10, H // 2),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
+
+        cv2.putText(shown, f"[{view_i+1}/{len(_VIEWS)}] {view}: {_VIEW_DESC[view]} (Tab/1-5 切换)",
+                    (10, shown.shape[0] - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(shown, f"FPS:{fps_ema:4.1f}  IDs:{n_ok}/{n_mk}", (10, 25),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA)
-        cv2.putText(disp,
+        cv2.putText(shown,
                     f"read {t_read*1000:.0f} | yolo {t_yolo*1000:.0f} | decode {t_dec*1000:.0f} ms",
                     (10, 48), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
-        cv2.imshow(win, disp)
-        if (cv2.waitKey(1) & 0xFF) == 27:
+        cv2.imshow(win, shown)
+        key = cv2.waitKey(1) & 0xFF
+        if key == 27:                                      # Esc 退
             break
+        elif key == 9:                                     # Tab 循环切换
+            view_i = (view_i + 1) % len(_VIEWS)
+        elif ord('1') <= key <= ord('5'):                 # 1-5 直接选
+            view_i = min(key - ord('1'), len(_VIEWS) - 1)
 
     cap.release()
     cv2.destroyAllWindows()
