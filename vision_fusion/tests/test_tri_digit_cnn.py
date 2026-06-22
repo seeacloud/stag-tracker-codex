@@ -165,3 +165,12 @@ def test_temporal_average_denoises():
         noisy = np.clip(base.astype(np.float32) + rng.normal(0, 25, base.shape), 0, 255).astype(np.uint8)
         last = ta.push((3, 4), noisy)
     assert float(last.std()) < 12.0      # 5 帧平均 → 噪声 ~÷√5
+
+
+def test_normalize_square_stretches_contrast():
+    from vision_fusion.digit_detect_tri import normalize_square
+    # 挤在 [120,160] 窄灰段的图,拉伸后应接近铺满 [0,255]
+    g = (np.linspace(120, 160, 200, dtype=np.float32)[None, :].repeat(200, 0)).astype(np.uint8)
+    out = normalize_square(g)
+    assert out.shape == g.shape and out.dtype == np.uint8
+    assert int(out.min()) < 30 and int(out.max()) > 225

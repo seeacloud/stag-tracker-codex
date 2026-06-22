@@ -40,6 +40,18 @@ def _ensure_gray(img: np.ndarray) -> np.ndarray:
     return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
 
+def normalize_square(square: np.ndarray, lo_pct: float = 2.0, hi_pct: float = 98.0) -> np.ndarray:
+    """逐 marker 百分位对比拉伸:把窄灰段拉到满 0-255,让淡 marker 数字更清晰。
+    用百分位(非 min/max)抗个别极值。对整张 200 crop 做(有黑边+白底+数字作动态范围参照),
+    不逐格(空格会放大噪声)。"""
+    g = _ensure_gray(square)
+    gf = g.astype(np.float32)
+    lo, hi = np.percentile(gf, [lo_pct, hi_pct])
+    if hi - lo < 1.0:
+        return g
+    return np.clip((gf - lo) / (hi - lo) * 255.0, 0, 255).astype(np.uint8)
+
+
 CHARS = "0123456789X"            # 11 类：0-9 与校验位 X(=10)
 
 # 切格几何锁定部署 marker 的 GUI 参数(digit_marker_tri_settings.json)。
@@ -75,8 +87,10 @@ def cell_centers(col_gap: float = TRI_COL_GAP, row_gap: float = TRI_ROW_GAP):
 
 def slice_cells(square: np.ndarray, half: float = CELL_HALF, out: int = CELL_OUT):
     """把拉正后的 marker 切成 4 个数字格(灰度 out×out)。训练与推理共用，
-    保证几何一致。先抹掉定向黑三角再切。square 可为灰度或 BGR。"""
+    保证几何一致。先逐 marker 归一化对比度、再抹掉定向黑三角、再切。
+    square 可为灰度或 BGR。"""
     gray = _ensure_gray(square)
+    gray = normalize_square(gray)          # 逐 marker 对比拉伸(训练/推理同源)
     gray = _mask_triangle(gray)
     s = gray.shape[0]
     h = int(half * s)
