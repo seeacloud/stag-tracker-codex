@@ -640,6 +640,8 @@ def main() -> int:
     parser.add_argument("--conf", type=float, default=0.3)
     parser.add_argument("--recognizer", choices=["cnn", "ocr"], default="cnn",
                         help="cnn=轻量数字分类器(默认,快); ocr=RapidOCR(对照)。")
+    parser.add_argument("--symbol", action="store_true", default=False,
+                        help="符号 marker 模式(symbol_cnn + L缺口定向 + cell_boxes 切格)。")
     parser.add_argument("--min-cell-conf", type=float, default=0.80,
                         help="接受 id 所需的 4 格最低置信度门槛(高=宁缺毋滥,少错 id;低=多解出)。")
     parser.add_argument("--no-track", action="store_true", default=False,
@@ -663,7 +665,18 @@ def main() -> int:
         print(f"[debug] dumping per-marker decode info → {dbg}")
 
     yolo = YOLO(args.model)
-    if args.recognizer == "cnn":
+    if args.symbol:
+        import json
+        from pathlib import Path as _P
+        from .symbol_marker import cell_boxes
+        s = json.loads(_P("symbol_marker_settings.json").read_text(encoding="utf-8")) \
+            if _P("symbol_marker_settings.json").exists() else {}
+        lp = {k: s[k] for k in ("line_ratio", "padding_ratio") if k in s}
+        recognizer = DigitClassifierTri(model_path="models/symbol_cnn.pt",
+                                        orient=symbol_orient, boxes=cell_boxes(**lp),
+                                        min_cell_conf=args.min_cell_conf)
+        print(f"recognizer: 符号 CNN (symbol_cnn.pt), L缺口定向, min_cell_conf={args.min_cell_conf}")
+    elif args.recognizer == "cnn":
         from pathlib import Path as _P
         if _P("models/tri_digit_cnn.pt").exists():
             recognizer = DigitClassifierTri(min_cell_conf=args.min_cell_conf)
