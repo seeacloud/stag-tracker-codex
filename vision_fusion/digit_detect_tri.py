@@ -124,6 +124,24 @@ def slice_cells(square: np.ndarray, half: float = CELL_HALF, out: int = CELL_OUT
     return cells
 
 
+def slice_by_boxes(square: np.ndarray, boxes, out: int = CELL_OUT) -> list:
+    """按显式的归一化格子框 [(x0,y0,x1,y1)*N] 切格(符号 marker 用)。boxes 来自
+    symbol_marker.cell_boxes —— render 与切格共用同一格子定义,天然对齐、符号不超格。
+    先逐 marker 归一化对比;不抹三角/底条(格子已避开它们)。"""
+    gray = normalize_square(_ensure_gray(square))
+    s = gray.shape[0]
+    cells = []
+    for nx0, ny0, nx1, ny1 in boxes:
+        x0, y0 = max(0, int(nx0 * s)), max(0, int(ny0 * s))
+        x1, y1 = min(s, int(nx1 * s)), min(s, int(ny1 * s))
+        crop = gray[y0:y1, x0:x1]
+        if crop.size == 0:
+            crop = np.full((out, out), 255, np.uint8)
+        cells.append(cv2.resize(crop, (out, out), interpolation=cv2.INTER_AREA))
+    return cells
+
+
+
 _GRID_CACHE: dict = {}
 
 
@@ -219,6 +237,50 @@ def orient_by_edge(square: np.ndarray) -> np.ndarray:
     """把最暗边旋到底部(符号 marker 定向)。"""
     order, _ = edge_ranking(square)
     rot = _EDGE_ROT_TO_BOTTOM[order[0]]
+    return square if rot is None else cv2.rotate(square, rot)
+
+
+# 符号 marker(L 缺口)定向:内部分隔只有"上竖+左横"两段黑线 → 封闭左上格。
+# 量中心四条半臂(上/右/下/左)的黑度,最黑的两条 = 实际画出的两段,据此定哪个角是封闭格。
+# 旋转把"封闭角"转到左上(TL)。corner 码 0=TL 1=TR 2=BR 3=BL(顺时针)。
+_SYM_ROT_TO_TL = {0: None, 1: cv2.ROTATE_90_COUNTERCLOCKWISE,
+                  2: cv2.ROTATE_180, 3: cv2.ROTATE_90_CLOCKWISE}
+
+
+def _arm_darkness(gray):
+    """中心四条半臂的黑度(去平面),顺序 [上,右,下,左]。"""
+    g = gray.astype(np.float32)
+    h, w = g.shape
+    xx, yy = _xy_grid(h, w)
+    x = xx.ravel(); y = yy.ravel(); z = g.ravel(); n = z.size
+    M = np.array([[x @ x, x @ y, x.sum()], [x @ y, y @ y, y.sum()],
+                  [x.sum(), y.sum(), n]], np.float64)
+    try:
+        a, b, c = np.linalg.solve(M, np.array([x @ z, y @ z, z.sum()], np.float64))
+        r = g - (a * xx + b * yy + c)
+    except np.linalg.LinAlgError:
+        r = g - g.mean()
+    s = h; m = s // 2; t = max(3, int(s * 0.06))
+    up = r[int(s * 0.15):m, m - t:m + t]
+    dn = r[m:int(s * 0.85), m - t:m + t]
+    lf = r[m - t:m + t, int(s * 0.15):m]
+    rt = r[m - t:m + t, m:int(s * 0.85)]
+    return [float(-arm.mean()) for arm in (up, rt, dn, lf)]
+
+
+def symbol_orient(square: np.ndarray) -> tuple[list[int], list[float]]:
+    """符号 marker 定向。返回 (排序后的封闭角码, 4 角分值)。
+    封闭角 = 两条相邻黑臂的夹角处。上+左黑→TL(0); 上+右→TR(1); 下+右→BR(2); 下+左→BL(3)。"""
+    arms = _arm_darkness(_ensure_gray(square))     # [上,右,下,左]
+    up, rt, dn, lf = arms
+    corner_score = [up + lf, up + rt, dn + rt, dn + lf]   # TL,TR,BR,BL
+    order = sorted(range(4), key=lambda i: corner_score[i], reverse=True)
+    return order, corner_score
+
+
+def orient_by_symbol(square: np.ndarray) -> np.ndarray:
+    order, _ = symbol_orient(square)
+    rot = _SYM_ROT_TO_TL[order[0]]
     return square if rot is None else cv2.rotate(square, rot)
 
 
