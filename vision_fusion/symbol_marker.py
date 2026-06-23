@@ -24,7 +24,7 @@ SYM_DEFAULTS = dict(
     padding_ratio=0.04,         # 裁切框相对白格内壁的等距内缩
     sym_fill=0.72,              # 符号占裁切框比例(<1 留白,不超格)
     stroke_ratio=0.18,
-    round_cap=True,
+    round_cap=False,
 )
 
 
@@ -53,19 +53,22 @@ def render_marker_symbol(marker_id: int, *, pixels: int = 300, **overrides) -> n
     cfg = {**SYM_DEFAULTS, **overrides}
     p = pixels
     L = max(2, int(p * cfg["line_ratio"]))
-    img = np.full((p, p), 255, np.uint8)
-    cv2.rectangle(img, (0, 0), (p - 1, p - 1), 0, L)               # 外框
+    cells = _white_cells(cfg["line_ratio"])
+    img = np.full((p, p), 0, np.uint8)                             # 全黑
+    # 整个内区填白(留外框 L),其余三格连通;只左上格被封闭。
+    cv2.rectangle(img, (L, L), (p - 1 - L, p - 1 - L), 255, -1)
     m = p // 2
-    cv2.rectangle(img, (m - L // 2, 0), (m + L // 2, m), 0, -1)       # 竖分隔:中心→上
-    cv2.rectangle(img, (m, m - L // 2), (p - 1, m + L // 2), 0, -1)   # 横分隔:中心→右
+    # 只画"上竖 + 左横"两段黑线 → 封闭左上格,其余连通(定向)。
+    cv2.rectangle(img, (m - L // 2, L), (m + L // 2, m + L // 2), 0, -1)   # 上竖(下探到中心交汇)
+    cv2.rectangle(img, (L, m - L // 2), (m + L // 2, m + L // 2), 0, -1)   # 左横(右探到中心交汇)
     chars = marker_chars(marker_id)
-    for ch, (nx0, ny0, nx1, ny1) in zip(chars, cell_boxes(**cfg)):
-        cw = int((nx1 - nx0) * p); chh = int((ny1 - ny0) * p)
-        side = max(12, int(min(cw, chh) * cfg["sym_fill"]))
+    for ch, (nx0, ny0, nx1, ny1) in zip(chars, cells):            # 符号放白格正中(上下左右居中)
+        cx = (nx0 + nx1) / 2 * p; cy = (ny0 + ny1) / 2 * p
+        box = (nx1 - nx0) * p - 2 * cfg["padding_ratio"] * p       # 裁切框边长
+        side = max(12, int(box * cfg["sym_fill"]))
         sym = draw_symbol(ch, size=side, stroke=max(2, int(cfg["stroke_ratio"] * side)),
                           round_cap=cfg["round_cap"])
-        gx0 = int(nx0 * p) + (cw - side) // 2
-        gy0 = int(ny0 * p) + (chh - side) // 2
+        gx0 = int(cx - side / 2); gy0 = int(cy - side / 2)
         roi = img[gy0:gy0 + side, gx0:gx0 + side]
         if roi.shape == sym.shape:
             img[gy0:gy0 + side, gx0:gx0 + side] = np.minimum(roi, sym)

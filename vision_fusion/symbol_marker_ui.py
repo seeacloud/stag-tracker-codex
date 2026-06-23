@@ -46,7 +46,7 @@ class SymbolMarkerUI:
         self.root.title("Symbol Marker 调参")
         self.marker_id = tk.IntVar(value=saved.get("marker_id", 283))
         self.pixels = tk.IntVar(value=saved.get("pixels", 600))
-        self.round_cap = tk.BooleanVar(value=saved.get("round_cap", True))
+        self.round_cap = tk.BooleanVar(value=saved.get("round_cap", False))
         self.show_cells = tk.BooleanVar(value=saved.get("show_cells", True))
         self.start_id = tk.IntVar(value=saved.get("start_id", 0))
         self.end_id = tk.IntVar(value=saved.get("end_id", 100))
