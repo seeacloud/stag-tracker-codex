@@ -19,12 +19,10 @@ from .symbol_marker import render_marker_symbol, checksum_char
 SETTINGS_FILE = Path("symbol_marker_settings.json")
 
 _RATIOS = [
-    ("border_ratio", 0.06, 0.02, 0.12),
-    ("bottom_extra_ratio", 0.06, 0.0, 0.15),
-    ("col_gap_ratio", 0.3765, 0.20, 0.55),
-    ("row_gap_ratio", 0.4176, 0.20, 0.60),
-    ("sym_size_ratio", 0.30, 0.15, 0.45),
-    ("stroke_ratio", 0.16, 0.06, 0.30),
+    ("line_ratio", 0.08, 0.04, 0.16),       # 黑线宽(外框=分隔,同步)
+    ("padding_ratio", 0.04, 0.0, 0.12),     # 裁切框相对白格内缩
+    ("sym_fill", 0.72, 0.45, 0.95),         # 符号占裁切框比例
+    ("stroke_ratio", 0.18, 0.08, 0.30),     # 符号线宽
 ]
 
 
@@ -99,15 +97,12 @@ class SymbolMarkerUI:
         img = self._gen(mid)
         disp = Image.fromarray(img).resize((360, 360), Image.NEAREST).convert("L")
         if self.show_cells.get():
-            # 用 slice_cells 的实际切格范围(cell_centers ± CELL_HALF)画细框,看符号是否落在格内
-            from .digit_detect_tri import cell_centers, CELL_HALF
+            from .symbol_marker import cell_boxes
             import PIL.ImageDraw as _D
-            d = _D.Draw(disp)
-            W = 360
-            for ncx, ncy in cell_centers():
-                x0 = int((ncx - CELL_HALF) * W); y0 = int((ncy - CELL_HALF) * W)
-                x1 = int((ncx + CELL_HALF) * W); y1 = int((ncy + CELL_HALF) * W)
-                d.rectangle([x0, y0, x1, y1], outline=0, width=1)   # 黑色 1px
+            d = _D.Draw(disp); W = 360
+            for x0, y0, x1, y1 in cell_boxes(**self._params()):
+                d.rectangle([int(x0 * W), int(y0 * W), int(x1 * W), int(y1 * W)],
+                            outline=0, width=1)
         self._tk = ImageTk.PhotoImage(disp)
         self.canvas.configure(image=self._tk)
         self.status.set(f"预览 {mid:03d}{checksum_char(mid)}")
