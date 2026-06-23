@@ -10,7 +10,7 @@ import numpy as np
 
 SYMBOLS = "0123456789X"
 # 逻辑标签 -> 画法 key(v8 锁定的 11 符号)
-_KIND = {"0": "dring", "1": "L", "2": "vbar", "3": "bslash", "4": "Tl",
+_KIND = {"0": "dring", "1": "L", "2": "hbar", "3": "bslash", "4": "Tl",
          "5": "corner", "6": "Y", "7": "J", "8": "Tr", "9": "fslash", "X": "box"}
 
 
@@ -44,6 +44,8 @@ def draw_symbol(char: str, size: int = 64, stroke: int = 10, round_cap: bool = F
         cv2.rectangle(g, P(18, 18), P(46, 46), 0, t, lineType=aa)
     elif k == "vbar":
         line((32, 16), (32, 48))
+    elif k == "hbar":
+        line((16, 32), (48, 32))
     elif k == "bslash":
         line((18, 18), (46, 46))
     elif k == "fslash":
