@@ -19,8 +19,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from .symbol_marker import render_marker_symbol, marker_chars, SYM_CENTER_Y
-from .digit_detect_tri import slice_cells, CHARS, _ensure_gray, orient_by_edge
+from .symbol_marker import render_marker_symbol, marker_chars, cell_boxes
+from .digit_detect_tri import slice_by_boxes, CHARS, _ensure_gray, orient_by_symbol
 from .digit_detect import warp_square
 from .nn_augment import random_degrade
 from .nn_synth_ui import overlay_marker, load_settings, CANVAS_W, CANVAS_H
@@ -42,13 +42,14 @@ def _render_params() -> dict:
     if not p.exists():
         return {}
     s = json.loads(p.read_text(encoding="utf-8"))
-    keys = ("pixels", "border_ratio", "bottom_extra_ratio",
-            "sym_size_ratio", "stroke_ratio")    # 不含 gap:列/行距锁定 TRI 常量,与切格一致
+    keys = ("pixels", "line_ratio", "padding_ratio", "sym_fill", "stroke_ratio", "round_cap")
     return {k: s[k] for k in keys if k in s}
 
 
 def _slice(sq):
-    return slice_cells(sq, mask_tri=False, mask_bottom=True, center_y=SYM_CENTER_Y)
+    """按 cell_boxes(与渲染同源)切 4 格。"""
+    return slice_by_boxes(sq, cell_boxes(**{k: v for k, v in _render_params().items()
+                                            if k in ("line_ratio", "padding_ratio")}))
 
 
 def main() -> int:
@@ -96,7 +97,7 @@ def main() -> int:
             sq = _ensure_gray(warp_square(scene, corners, size=200))
             if sq.size == 0:
                 continue
-            sq = orient_by_edge(sq)        # 底条旋到底部
+            sq = orient_by_symbol(sq)      # L缺口旋正到TL
             for ch, cell in zip(chars, _slice(sq)):
                 cv2.imwrite(str(out / ch / f"m{mid:03d}_s{counts[ch]:05d}.png"), cell)
                 counts[ch] += 1
