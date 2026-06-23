@@ -399,7 +399,7 @@ class DigitClassifierTri:
     def __init__(self, model_path: str = "models/tri_digit_cnn.pt",
                  min_cell_conf: float = 0.80, max_orient: int = 1,
                  orient=None, mask_tri: bool = True, mask_bottom: bool = False,
-                 center_y: float = 0.5):
+                 center_y: float = 0.5, boxes=None):
         import torch
         from .nn_train_digit import DigitCNN
         self.torch = torch
@@ -409,15 +409,22 @@ class DigitClassifierTri:
         self.model.eval()
         self.min_cell_conf = min_cell_conf
         self.max_orient = max_orient
-        # 定向函数:数字用 corner_ranking(默认),符号用 edge_ranking。切格抹除:
-        # 数字抹左上三角(mask_tri),符号抹底边黑条(mask_bottom)。center_y:符号区上移。
+        # 定向:数字 corner_ranking;符号 symbol_orient(传 orient=symbol_orient + boxes)。
         self.orient = orient if orient is not None else corner_ranking
-        self.rot_map = _EDGE_ROT_TO_BOTTOM if self.orient is edge_ranking else _ROT_TO_TL
+        if self.orient is symbol_orient:
+            self.rot_map = _SYM_ROT_TO_TL
+        elif self.orient is edge_ranking:
+            self.rot_map = _EDGE_ROT_TO_BOTTOM
+        else:
+            self.rot_map = _ROT_TO_TL
         self.mask_tri = mask_tri
         self.mask_bottom = mask_bottom
         self.center_y = center_y
+        self.boxes = boxes      # 符号:cell_boxes 列表 → 用 slice_by_boxes;None → slice_cells
 
     def _slice(self, sq):
+        if self.boxes is not None:
+            return slice_by_boxes(sq, self.boxes)
         return slice_cells(sq, mask_tri=self.mask_tri, mask_bottom=self.mask_bottom,
                            center_y=self.center_y)
 

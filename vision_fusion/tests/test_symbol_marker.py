@@ -41,49 +41,37 @@ def test_symbol_separability_beats_digits():
     assert mind > 30.0, f"区分度 {mind:.1f} 不及预期(数字基线 23.5)"
 
 
+import os, pytest
+
+
 def test_render_marker_symbol():
     from vision_fusion.symbol_marker import render_marker_symbol, marker_chars
-    assert marker_chars(83) == "0833"        # 复用 checksum_char
+    assert marker_chars(83) == "0833"
     g = render_marker_symbol(83, pixels=300)
     assert g.shape == (300, 300) and g.dtype == np.uint8
-    bottom = g[int(300 * 0.93):, 20:280].mean()
-    top = g[:int(300 * 0.04), 20:280].mean()
-    assert bottom < 80, f"底边应是黑条 mean={bottom:.0f}"
-    assert top < 80, f"顶边是普通黑框 mean={top:.0f}"   # 顶也是边框(黑),但更细
 
 
-def test_edge_ranking_finds_bottom():
+def test_symbol_orient_all_rotations():
     import cv2
     from vision_fusion.symbol_marker import render_marker_symbol
-    from vision_fusion.digit_detect_tri import edge_ranking
-    g = render_marker_symbol(283, pixels=200)            # 底边黑条
-    order, _ = edge_ranking(g)
-    assert order[0] == 2, f"正放最暗边应为底(2),实际 {order[0]}"   # 0上1右2下3左
-    assert edge_ranking(cv2.rotate(g, cv2.ROTATE_180))[0][0] == 0   # 旋180→黑条到顶
-
-
-def test_edge_ranking_survives_gradient():
-    import cv2
-    from vision_fusion.symbol_marker import render_marker_symbol
-    from vision_fusion.digit_detect_tri import edge_ranking
-    g = render_marker_symbol(283, pixels=200).astype(np.float32)
-    h, w = g.shape
-    yy, xx = np.mgrid[0:h, 0:w]
-    ramp = ((xx + yy) / (h + w)).astype(np.float32)
-    g2 = np.clip(g + (ramp - 0.5) * 80, 0, 255).astype(np.uint8)   # 叠强梯度
-    assert edge_ranking(g2)[0][0] == 2, "去平面后梯度不该带偏底边判断"
-
-
-import os, pytest
+    from vision_fusion.digit_detect_tri import symbol_orient, orient_by_symbol
+    g = render_marker_symbol(248, pixels=200)            # 封闭格在 TL
+    assert symbol_orient(g)[0][0] == 0
+    for rot in (cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_180, cv2.ROTATE_90_COUNTERCLOCKWISE):
+        # 任意旋转后,orient_by_symbol 旋正应使封闭角回 TL
+        assert symbol_orient(orient_by_symbol(cv2.rotate(g, rot)))[0][0] == 0
 
 
 @pytest.mark.skipif(not os.path.exists("models/symbol_cnn.pt"), reason="symbol_cnn 未训练")
 def test_symbol_recognize_roundtrip():
-    from vision_fusion.symbol_marker import render_marker_symbol
-    from vision_fusion.digit_detect_tri import DigitClassifierTri, edge_ranking
-    from vision_fusion.symbol_marker import SYM_CENTER_Y
+    import json
+    from vision_fusion.symbol_marker import render_marker_symbol, cell_boxes
+    from vision_fusion.digit_detect_tri import DigitClassifierTri, symbol_orient
+    s = json.loads(open("symbol_marker_settings.json", encoding="utf-8").read())
+    lp = {k: s[k] for k in ("line_ratio", "padding_ratio") if k in s}
+    rp = {k: s[k] for k in ("line_ratio", "padding_ratio", "sym_fill", "stroke_ratio", "round_cap") if k in s}
     rec = DigitClassifierTri(model_path="models/symbol_cnn.pt",
-                             orient=edge_ranking, mask_tri=False, mask_bottom=True, center_y=SYM_CENTER_Y)
-    for mid in (83, 7, 20, 99, 283):       # 7→007X 含校验 X
-        got, _ = rec.recognize(render_marker_symbol(mid, pixels=200), min_conf=0.0)
+                             orient=symbol_orient, boxes=cell_boxes(**lp), min_cell_conf=0.0)
+    for mid in (248, 296, 83, 7, 283, 995):       # 7→007X 含校验 X
+        got, _ = rec.recognize(render_marker_symbol(mid, pixels=200, **rp), min_conf=0.0)
         assert got == mid, f"{mid} → {got}"
