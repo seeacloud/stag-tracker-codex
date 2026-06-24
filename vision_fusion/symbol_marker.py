@@ -22,8 +22,8 @@ from .symbol_set import draw_symbol
 SYM_DEFAULTS = dict(
     line_ratio=0.08,            # 黑线宽(外框=分隔,同步)
     padding_ratio=0.04,         # 裁切框相对白格内壁的等距内缩
-    sym_fill=0.72,              # 符号占裁切框比例(<1 留白,不超格)
-    stroke_ratio=0.18,
+    sym_fill=1.0,               # 符号填满裁切框(贴图约定:符号占满格子)
+    stroke_ratio=0.25,          # 线宽 = 框边长 25%(贴图:红框100则线宽25)
     round_cap=False,
 )
 

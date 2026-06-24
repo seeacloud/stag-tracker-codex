@@ -17,10 +17,11 @@ def test_draw_symbol_shape_and_ink():
         assert int(g.max()) > 200     # 有白底
 
 
-def test_draw_symbol_stroke_scales_ink():
-    thin = int((draw_symbol("4", 64, 6) < 128).sum())     # ⊢ 竖+横
-    thick = int((draw_symbol("4", 64, 16) < 128).sum())
-    assert thick > thin               # 线宽变大→墨更多
+def test_draw_symbol_loads_png():
+    # 贴图模式:每个符号来自 0-9X/<char>.png,有墨且非空白
+    for ch in SYMBOLS:
+        g = draw_symbol(ch, size=64)
+        assert (g < 128).sum() > 50       # 有实质墨量
 
 
 def test_symbol_separability_beats_digits():
