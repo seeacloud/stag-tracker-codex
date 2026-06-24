@@ -15,7 +15,7 @@ import cv2
 import numpy as np
 
 SYMBOLS = "0123456789X"
-_ICON_DIR = Path(__file__).resolve().parent.parent / "0-9X"
+_ICON_DIR = Path(__file__).resolve().parent.parent / "0-9X_v2"
 
 
 @lru_cache(maxsize=16)
