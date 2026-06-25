@@ -1,13 +1,13 @@
 {
-  "marker_id": 258,
+  "marker_id": 138,
   "pixels": 600,
   "round_cap": false,
-  "show_cells": false,
+  "show_cells": true,
   "start_id": 0,
   "end_id": 100,
   "output_dir": "symbol_markers",
-  "line_ratio": 0.055,
-  "padding_ratio": 0.0,
-  "sym_fill": 0.95,
-  "stroke_ratio": 0.211
+  "line_ratio": 0.04,
+  "padding_ratio": 0.0397,
+  "sym_fill": 1.0,
+  "stroke_ratio": 0.2466
 }

@@ -21,7 +21,7 @@ SETTINGS_FILE = Path("symbol_marker_settings.json")
 _RATIOS = [
     ("line_ratio", 0.08, 0.04, 0.16),       # 黑线宽(外框=分隔,同步)
     ("padding_ratio", 0.04, 0.0, 0.12),     # 裁切框相对白格内缩
-    ("sym_fill", 0.72, 0.45, 0.95),         # 符号占裁切框比例
+    ("sym_fill", 0.72, 0.45, 1.0),          # 符号占裁切框比例
     ("stroke_ratio", 0.18, 0.08, 0.30),     # 符号线宽
 ]
 
@@ -52,6 +52,7 @@ class SymbolMarkerUI:
         self.end_id = tk.IntVar(value=saved.get("end_id", 100))
         self.output_dir = tk.StringVar(value=saved.get("output_dir", "symbol_markers"))
         self.ratios = {k: tk.DoubleVar(value=saved.get(k, d)) for k, d, _, _ in _RATIOS}
+        self._val_labels = {}
         self.status = tk.StringVar(value="就绪")
         self._build_ui()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -80,6 +81,9 @@ class SymbolMarkerUI:
             ttk.Label(f, text=key, width=18).pack(side=tk.LEFT)
             ttk.Scale(f, variable=self.ratios[key], from_=lo, to=hi, length=150,
                       orient=tk.HORIZONTAL, command=self._refresh).pack(side=tk.LEFT)
+            val = ttk.Label(f, width=6)
+            val.pack(side=tk.LEFT, padx=4)
+            self._val_labels[key] = val
         ttk.Button(left, text="保存当前 marker", command=self._save_one).pack(fill=tk.X, pady=(8, 3))
         rng = ttk.Frame(left); rng.pack(fill=tk.X, pady=3)
         ttk.Label(rng, text="区间").pack(side=tk.LEFT)
@@ -93,6 +97,8 @@ class SymbolMarkerUI:
         self.canvas = ttk.Label(self.root); self.canvas.pack(side=tk.LEFT, padx=8, pady=8)
 
     def _refresh(self, *_):
+        for k, lbl in self._val_labels.items():
+            lbl.config(text=f"{self.ratios[k].get():.3f}")
         mid = self.marker_id.get()
         img = self._gen(mid)
         disp = Image.fromarray(img).resize((360, 360), Image.NEAREST).convert("L")
