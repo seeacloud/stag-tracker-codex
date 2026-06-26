@@ -551,6 +551,28 @@ class _TemporalAvg:
             del self.buf[k]
 
 
+def _drop_nested(entries, area_ratio=0.7):
+    """去掉嵌套检测:若一个框中心落在另一个**更大**框内、且面积明显更小,丢弃它。
+    符号 marker 的空心方框格(□)会被 YOLO 误当成小 marker,这里滤掉。"""
+    items = []
+    for pts, sq in entries:
+        a = float(cv2.contourArea(pts.astype(np.float32)))
+        items.append((pts, sq, a, pts.mean(axis=0)))
+    keep = []
+    for pts, sq, a, c in items:
+        nested = False
+        for pts2, _sq2, a2, _c2 in items:
+            if a2 <= a:
+                continue
+            if cv2.pointPolygonTest(pts2.astype(np.float32), (float(c[0]), float(c[1])), False) >= 0 \
+               and a < a2 * area_ratio:
+                nested = True
+                break
+        if not nested:
+            keep.append((pts, sq))
+    return keep
+
+
 def decode_markers_cached(entries, recognizer, tracker, decay: float = 0.6):
     """一帧多 marker:**每帧都重新识别**(批处理,便宜),静止位置多帧平均降噪 + 衰减投票平滑。
 
@@ -642,6 +664,12 @@ def main() -> int:
                         help="cnn=轻量数字分类器(默认,快); ocr=RapidOCR(对照)。")
     parser.add_argument("--symbol", action="store_true", default=False,
                         help="符号 marker 模式(symbol_cnn + L缺口定向 + cell_boxes 切格)。")
+    parser.add_argument("--bit", action="store_true", default=False,
+                        help="bit marker 模式(2×2象限二值化,无CNN,读 bit_marker_settings.json)。")
+    parser.add_argument("--tribit", action="store_true", default=False,
+                        help="tri-bit marker 4×4模式(0#三角定向+基准二值化+汉明纠错,读 tri_bit_marker_settings.json)。")
+    parser.add_argument("--compare-apriltag", action="store_true", default=False,
+                        help="并行检测 AprilTag tag36h11(蓝框)对比;原始灰度+CLAHE都测取较好。")
     parser.add_argument("--min-cell-conf", type=float, default=0.80,
                         help="接受 id 所需的 4 格最低置信度门槛(高=宁缺毋滥,少错 id;低=多解出)。")
     parser.add_argument("--no-track", action="store_true", default=False,
@@ -665,7 +693,17 @@ def main() -> int:
         print(f"[debug] dumping per-marker decode info → {dbg}")
 
     yolo = YOLO(args.model)
-    if args.symbol:
+    if args.tribit:
+        from .tri_bit_detect import TriBitRecognizer
+        mg = 0.05 if args.min_cell_conf == 0.80 else args.min_cell_conf
+        recognizer = TriBitRecognizer(min_cell_conf=mg)
+        print(f"recognizer: tri-bit 4x4(方差定向+0#基准二值化+汉明纠错), min_contrast={mg}")
+    elif args.bit:
+        from .bit_detect import BitRecognizerTri
+        mg = 0.15 if args.min_cell_conf == 0.80 else args.min_cell_conf
+        recognizer = BitRecognizerTri(min_cell_conf=mg)
+        print(f"recognizer: bit 二值化(无CNN), 13码+mod13校验, min_gap={mg}")
+    elif args.symbol:
         import json
         from pathlib import Path as _P
         from .symbol_marker import cell_boxes
@@ -689,6 +727,14 @@ def main() -> int:
         print("recognizer: RapidOCR")
     clahe = cv2.createCLAHE(clipLimit=5.0, tileGridSize=(8, 8))
     win = "Digit Marker TRI"
+
+    at_detector = None
+    at_stats = {"frames": 0, "ours_det": 0, "at_det": 0}
+    if args.compare_apriltag:
+        _ad = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36h11)
+        _ap = cv2.aruco.DetectorParameters()
+        at_detector = cv2.aruco.ArucoDetector(_ad, _ap)
+        print("对比模式: AprilTag tag36h11(蓝框) | 你的marker(绿框)")
 
     src = int(args.source) if args.source.isdigit() else args.source
     exposure = args.camera_exposure if args.camera_exposure is not None else -6
@@ -740,6 +786,33 @@ def main() -> int:
                 square = warp_square(enhanced, pts, size=200)
                 if square.size:
                     entries.append((pts, square))
+        entries = _drop_nested(entries)            # 去嵌套:符号□格会被YOLO当小marker,丢掉被大框包住的
+        # AprilTag 优先认领:检出 AprilTag → 从你的 entries 里剔除位置重叠的(互斥)
+        at_results = []
+        if at_detector is not None:
+            best_ids, best_corners = None, None
+            for img in (gray, enhanced):
+                cs, ids, _ = at_detector.detectMarkers(img)
+                cnt = 0 if ids is None else len(ids)
+                if cnt > (0 if best_ids is None else len(best_ids)):
+                    best_ids, best_corners = ids, cs
+            if best_ids is not None:
+                for tid, c in zip(best_ids.flatten(), best_corners):
+                    at_results.append((int(tid), c.reshape(-1, 2)))
+            if at_results:
+                at_centers = [poly.mean(0) for _, poly in at_results]
+                kept = []
+                for pts, square in entries:
+                    ec = pts.mean(0)
+                    # 你的检出中心若落在某 AprilTag 附近(<其半边长),判为同一物理marker→剔除
+                    claimed = False
+                    for (_, poly), ac in zip(at_results, at_centers):
+                        half = 0.5 * np.hypot(*(poly[0] - poly[2]))  # 对角半长
+                        if np.hypot(*(ec - ac)) < half:
+                            claimed = True; break
+                    if not claimed:
+                        kept.append((pts, square))
+                entries = kept
         n_mk = len(entries)
         # 解码:有跟踪→已锁定的跳过 CNN(稳态 decode≈0);无跟踪→每帧重识别
         if tracker is not None:
@@ -782,6 +855,20 @@ def main() -> int:
                 cv2.putText(disp, txt, (int(center[0]) - 5, int(center[1]) + 5),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 180, 180), 1, cv2.LINE_AA)
 
+        # AprilTag 已在前面检测并认领(互斥),这里只画蓝框
+        if at_detector is not None:
+            for tid, poly in at_results:
+                p = poly.reshape(-1, 1, 2).astype(np.int32)
+                cv2.polylines(disp, [p], True, (255, 80, 0), 2, cv2.LINE_AA)
+                cen = poly.mean(0).astype(int)
+                cv2.putText(disp, f"AT{tid}", (cen[0] - 12, cen[1]),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 80, 0), 2, cv2.LINE_AA)
+            at_n = len(at_results)
+            at_stats["frames"] += 1
+            at_stats["ours_det"] += n_ok
+            at_stats["at_det"] += at_n
+            cv2.putText(disp, f"OURS(green) {n_ok}  vs  APRILTAG(blue) {at_n}",
+                        (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
 
         t_dec = time.perf_counter() - t
 
@@ -827,6 +914,11 @@ def main() -> int:
     cv2.destroyAllWindows()
     if dbg_log is not None:
         dbg_log.close()
+    if at_detector is not None and at_stats["frames"]:
+        f = at_stats["frames"]
+        print(f"\n=== 对比统计 ({f} 帧) ===")
+        print(f"  你的marker 累计检出: {at_stats['ours_det']}  (均 {at_stats['ours_det']/f:.2f}/帧)")
+        print(f"  AprilTag  累计检出: {at_stats['at_det']}  (均 {at_stats['at_det']/f:.2f}/帧)")
     return 0
 
 
